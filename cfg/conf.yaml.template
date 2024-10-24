@@ -1,0 +1,27 @@
+config:
+  #Datastore path. This folder contains all the assets data and stac backups,
+  #in the subfolders defined above. It is important this is one single folder
+  #with its subfolders to be on th same filesystem, to ensure move between the
+  #stagein and the assets folder is atomic
+  datastore_folder: /mystore/
+  #Folder where data providers needs to upload the assets for the collection
+  #This folder needs to be exposed via a given access API, S3 and FTP are
+  #possible solutions. In the folder, a sub-folder needs to be created for
+  #each collection for its assets upload by the user.
+  stagein_subfolder: stagein
+  #In this folder the registration API will store the STAC items pushed into
+  #the catalogue for backup purposes
+  stac_subfolder: stac
+  #In this folder the registration API will move the STAC items assets uploaded
+  #in the stagein folder, organizing them according to a given standard path
+  #This folder is expected to be exposed in read-only mode togheter by the catalogue
+  #via an HTTP or S3 interface
+  assets_subfolder: assets
+  #This is the address of the catalogue where the STAC items will be posted
+  catalogue_address: http://mycatalogue:8000/
+  #This is the catalogue main STAC catalogue endopoint where the collections will be created
+  catalogue_main_collection: metadata:main
+  #This is the URL to which the assets_folder is exported for download of the assets.
+  #This URL will be used by the software to create assets download links for the
+  #assets stored into the assets_folder path
+  datastore_external_url: http://d.83b0cfc1.nip.io/{coll_id}/

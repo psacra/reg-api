@@ -1,0 +1,4 @@
+#!/bin/bash
+
+docker stop reg-api-server
+docker rm reg-api-server

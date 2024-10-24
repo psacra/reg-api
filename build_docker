@@ -1,0 +1,4 @@
+#!/bin/bash
+#Create virtual environment for fastAPI development
+
+docker build -t reg-api:latest ./

@@ -1,0 +1,8 @@
+#/bin/bash
+#Generate the mount folders for the docker command according to the application configuration
+
+CURDIR="`readlink -f $0`"; CURDIR="${CURDIR%/*}"
+CFGDIR="$CURDIR/cfg"
+datastore_folder="`gawk 'BEGIN{FS=" *:? *"}{if($2=="datastore_folder")print$3}' $CFGDIR/conf.yaml`"
+
+echo "-v $datastore_folder:$datastore_folder -v $CFGDIR:/home/reg-api/cfg"

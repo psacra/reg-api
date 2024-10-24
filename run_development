@@ -1,0 +1,6 @@
+#!/bin/bash
+#Start docker service for development (with logs and possibility to edit the source code
+
+CURDIR="`readlink -f $0`"; CURDIR="${CURDIR%/*}"
+echo "After execution, you can run the dev environment via ' fastapi dev --host 0.0.0.0 '"
+docker run -u `id -u`:`id -g` --name reg-api-server --network=host `bash $CURDIR/mountfolders_docker` -v $CURDIR/bin:/home/reg-api/bin -v $CURDIR/src:/home/reg-api/src -it --rm --entrypoint /bin/bash reg-api:latest

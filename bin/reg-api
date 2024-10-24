@@ -1,0 +1,273 @@
+#!/bin/env python3
+
+#Basic imports
+import os
+import yaml
+import json
+import argparse
+import logging
+import sqlite3
+from getpass import getpass
+import hashlib
+from urllib.request import Request, urlopen
+from urllib.error import URLError, HTTPError
+
+#Setup logging
+log = logging.getLogger(__name__)
+logging.basicConfig(encoding='utf-8', level=logging.DEBUG)
+
+#Get commandline input
+parser = argparse.ArgumentParser(prog='Registration API Gateway configuration tool',
+                    description='Manage Registation API Gateway')
+subparsers = parser.add_subparsers()
+parser_coll = subparsers.add_parser('coll', help='Manage registered collections into the catalogue')
+parser_coll.add_argument('coll_action',choices=['add', 'del', 'update','check'], help='Action to be performed on the catalogue collection')
+parser_coll.add_argument('coll_id', type=str, help='ID of the catalogue collection.')
+
+parser_user = subparsers.add_parser('user', help='Manage user accounts (for registration API only)')
+parser_user.add_argument('user_action',choices=['add', 'del', 'reset','list'], help='Action to be performed on the user account')
+parser_user.add_argument('username', type=str, nargs='?', help='Username of the user')
+parser_user.add_argument('password', type=str, nargs='?', help='Password of the user (if not provided, it is asked via stdin)')
+
+parser_collauth = subparsers.add_parser('auth', help='Authorize users to publish for a collection')
+parser_collauth.add_argument('auth_action',choices=['add', 'del', 'list'], help='Action to be performed on the authorization rule')
+parser_collauth.add_argument('username', nargs='?', type=str, help='Username of the user')
+parser_collauth.add_argument('coll_id', nargs='?', type=str, help='ID of the collection')
+parser_collauth.add_argument('stagein_bucket', nargs='?', type=str, help='Name of the stagein bucket')
+parser_collauth.add_argument('-D','--allow-delete', action='store_true', default=False, help='Allow the user also to delete from a collection. NOTE: This is risky, give it only to administrators or in the beginning during debug')
+
+parser_init = subparsers.add_parser('initdb', help='Initialize application DB')
+parser_init.add_argument('dbdriver',nargs='?',choices=['sqlite'],default='sqlite',help='DB driver. Only SQLite is supported')
+
+args = parser.parse_args()
+args_dict = vars(args)
+
+#Load configuration
+def load_conf():
+  CURPATH = os.path.dirname(os.path.realpath(__file__))
+  CFGPATH = os.path.realpath(os.path.join(CURPATH,"../cfg"))
+  CFGFILE = os.path.join(CFGPATH,"conf.yaml")
+  with open(CFGFILE,'r') as f:
+    cfg=yaml.safe_load(f)['config']
+  cfg['config_path']=CFGPATH
+  return cfg
+conf = load_conf()
+
+#Load Auth DB
+con = sqlite3.connect(os.path.join(conf['config_path'],"auth.db"),check_same_thread=False)
+
+
+#Execute action
+if 'dbdriver' in args_dict:
+  #Initialize database
+  cur = con.cursor()
+  cur.execute("CREATE TABLE auth(id INTEGER PRIMARY KEY, username TEXT, password_sha256 TEXT);")
+  cur.execute("CREATE TABLE user_collection_write_map(collection_name TEXT, user_id INTEGER, stagein_path TEXT, assets_path TEXT, stacs_path TEXT, datastore_url TEXT, cat_post_url TEXT, extra_auths INTEGER, UNIQUE (collection_name,user_id));")
+  cur.close()
+
+elif 'user_action' in args_dict:
+  #A user action is to be executed
+
+  #Check parameters (for all we need an username and password, except list
+  if args.user_action!='list':
+    if args.username is None:
+      log.error('Username is mandatory!')
+      exit(1)
+    if args.user_action!='del':
+      if args.password is None:
+        args.password=getpass("Provide password: ")
+      #Convert password to SHA256
+      args.password=hashlib.sha256(args.password.encode("utf8")).hexdigest()
+
+  #Get DB cursor
+  cur = con.cursor()
+
+  #Execute query (according to user action)
+  if args.user_action=='add':
+    cur.execute("INSERT INTO auth (username,password_sha256) VALUES (:username,:password);",{"username":args.username,"password":args.password})
+  elif args.user_action=='del':
+    cur.execute("DELETE FROM auth WHERE username=:username;",{"username":args.username})
+  elif args.user_action=='reset':
+    cur.execute("UPDATE auth SET password_sha256=:password WHERE username=:username;",{"username":args.username,"password":args.password})
+  elif args.user_action=='list':
+    cur.execute("SELECT * FROM auth;")
+    print("User ID | Username     |   Password SHA256")
+    for r in cur:
+      print(r)
+  else:
+    log.error('Invalid user action!')
+    exit(1)
+  cur.close()
+
+elif 'auth_action' in args_dict:
+  #Open cursor
+  cur = con.cursor()
+
+  #Check parameters (for all we need an username and password, except list
+  if args.auth_action=='list':
+    #This is a simple query
+    cur.execute("SELECT * FROM user_collection_write_map;")
+    print("Collection ID | User ID     | Stagein Path | Assets Path | STACs Path | External datastore URL | Internal catalogue Post URL | Extra auhtorizations (1=DELETE)")
+    for r in cur:
+      print(r)
+    cur.close()
+    con.close()
+    exit(0)
+
+  #Check mandatory arguments
+  if args.username is None:
+    log.error('Username is mandatory!')
+    exit(1)
+  #Retreive user ID from catalogue and check user exists
+  cur.execute("SELECT rowid FROM auth WHERE username=:username;",{"username":args.username})
+  user_id=cur.fetchall()
+  if len(user_id)!=1:
+    log.error(f'Username {args.username} does not exist!')
+    exit(1)
+  user_id=user_id[0][0]
+
+  if args.coll_id is None:
+    log.error('Collection ID is mandatory!')
+    exit(1)
+  #Check collection exists
+  collection_json=os.path.join(conf['datastore_folder'],os.path.join(conf['stac_subfolder'],args.coll_id+'.json'))
+  if not os.path.exists(collection_json):
+    log.error(f"JSON description for collection not present: File {collection_json} not found!")
+    exit(1)
+  
+  if args.auth_action=='del':
+    #Delete query
+    cur.execute("DELETE FROM user_collection_write_map WHERE user_id=:user_id AND collection_name=:collection_name;",{"user_id":user_id,"collection_name":args.coll_id})
+    cur.close()
+    con.commit()
+    con.close()
+    exit(0)
+
+  #If we are here, then this is an add query
+  if args.stagein_bucket is None:
+      log.error('Stagein bucket is mandatory!')
+      exit(1)
+  
+  #Find paths and check if they exists
+  stagein_path=os.path.join(conf['datastore_folder'],os.path.join(conf['stagein_subfolder'],args.stagein_bucket))
+  if not os.path.exists(stagein_path):
+    log.error(f'Stagein path {stagein_path} does not exists. Are you sure you created the bucket in the stagein area?')
+    exit(1)
+  assets_path=os.path.join(conf['datastore_folder'],os.path.join(conf['assets_subfolder'],args.coll_id))
+  if not os.path.exists(assets_path):
+    new_path=input(f'WARNING: Assets path for the collection {assets_path} does not exist. Specify a custom path manually or press enter to create it! ')
+    if new_path is None or new_path=='':
+      #Create default path
+      os.mkdir(assets_path)
+    else:
+      assets_path=new_path
+    if not os.path.exists(assets_path):
+      log.error(f"Assets path {assets_path} still does not exist, and it is mandatory. Exiting")
+      exit(1)
+  stacs_path=os.path.join(conf['datastore_folder'],os.path.join(conf['stac_subfolder'],args.coll_id))
+  if not os.path.exists(stacs_path):
+    new_path=input(f'WARNING: STACs path for the collection {stacs_path} does not exist. Specify a custom path manually or press enter to create it! ')
+    if new_path is None or new_path=='':
+      #Create default path
+      os.mkdir(stacs_path)
+    else:
+      stacs_path=new_path
+    if not os.path.exists(stacs_path):
+      log.error(f"STACs path {stacs_path} still does not exist, and it is mandatory. Exiting")
+      exit(1)
+  datastore_url=conf['datastore_external_url'].replace('{coll_id}',args.coll_id).replace('{stagein_bucket}',args.stagein_bucket)
+  cat_post_url=f"{conf['catalogue_address']}collections/{args.coll_id}/items"
+  extra_auths=0
+  if args.allow_delete==1:
+    extra_auths=1
+
+  cur.execute("INSERT INTO user_collection_write_map (collection_name, user_id, stagein_path, assets_path, stacs_path, datastore_url, cat_post_url,extra_auths) VALUES (?,?,?,?,?,?,?,?);",(args.coll_id,user_id,stagein_path,assets_path,stacs_path,datastore_url,cat_post_url,extra_auths))
+  cur.close()
+  con.commit()
+  con.close()
+  exit(0)
+
+
+elif 'coll_action' in args_dict:
+  #Close DB, we do not need it here
+  con.close()
+
+  #Check if collection is defined locally
+  collection_json=os.path.join(conf['datastore_folder'],os.path.join(conf['stac_subfolder'],args.coll_id+'.json'))
+  if not os.path.exists(collection_json):
+    log.error(f"JSON description for collection not present: File {collection_json} not found!")
+    exit(1)
+
+  #Read the collection JSON
+  with open(collection_json, 'rb') as f:
+    coll_data = f.read()
+
+  #Check the ID of the collection is correct (otherwise we make a mess in the catlaogue)
+  try:
+    coll_json = json.loads(coll_data)
+  except Exception as e:
+    log.error("Invalid collection JSON: "+str(e))
+    exit(1)
+  if coll_json['type']!='Collection':
+    log.error(f"{collection_json} is not a STAC collection! Type!=Collection")
+    exit(1)
+  if coll_json['id']!=args.coll_id:
+    log.error(f"{collection_json} id is {coll_json['id']}, but {args.coll_id} is expected!")
+    exit(1)
+
+
+  #Construct catalogue request
+  if args.coll_action == 'add':
+    cat_req_url=f"{conf['catalogue_address']}collections/{conf['catalogue_main_collection']}/items"
+    log.info(f"POST {collection_json} to {cat_req_url}...")
+    req = Request(cat_req_url, coll_data, headers={'Content-Type':'application/geo+json'}, method='POST')
+  elif args.coll_action == 'del':
+    cat_req_url=f"{conf['catalogue_address']}collections/{conf['catalogue_main_collection']}/items/{args.coll_id}"
+    log.info(f"DELETE {args.coll_id} to {cat_req_url}...")
+    req = Request(cat_req_url, headers={'Content-Type':'application/geo+json'}, method='DELETE')
+  elif args.coll_action == 'update':
+    cat_req_url=f"{conf['catalogue_address']}collections/{conf['catalogue_main_collection']}/items/{args.coll_id}"
+    log.info(f"PUT {args.coll_id} to {cat_req_url}...")
+    req = Request(cat_req_url, coll_data, headers={'Content-Type':'application/geo+json'}, method='PUT')
+  elif args.coll_action == 'check':
+    cat_req_url=f"{conf['catalogue_address']}collections/{conf['catalogue_main_collection']}/items/{args.coll_id}"
+    log.info(f"GET {args.coll_id} from {cat_req_url}...")
+    req = Request(cat_req_url, coll_data, headers={'Content-Type':'application/geo+json'}, method='GET')
+  else:
+    log.error("Invalid collection action")
+    exit(1)
+
+  try:
+    response = urlopen(req)
+  except HTTPError as e:
+    response_text=e.read().decode('utf-8')
+    response_status=str(e)
+    exit_code=1
+  except URLError as e:
+    response_status='URLError'
+    response_text=str(e)
+    exit_code=2
+  except Exception as e:
+    response_status='Exception'
+    resonse_text=str(e)
+    exit_code=3
+  else:
+    response_status='OK'
+    response_text=response.read().decode('utf-8')
+    exit_code=0
+
+  print(f"{response_status}: {response_text}")
+  exit(exit_code)
+
+
+else:
+  log.error("invalid action")
+  exit(1)
+
+#Close DB and update changes
+con.commit()
+con.close()
+
+#All fine, exit
+exit(0)
+
