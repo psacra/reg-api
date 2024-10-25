@@ -84,10 +84,10 @@ The STAC Item or STAC ItemCollection to be published needs to respect the follow
 - If a _collection_ metadata is present, it needs to contain the same value as _{collectionId}_. If it is not present, it will be added with the same value as _{collectionId}_
 - The _id_ metadata can contain only the [a-zA-Z0-9._-] characters and shall have maximum 100 characters.
 - Each asset of the STAC Item containing an URI as "href" is ingored and will be posted into the Catalogue as-is
-- Each asset of the STAC Item containing a path as "href" is ingested, it shall thus have
-  - A asset key containing only the [a-zA-Z0-9._-] characters and lenght of maximum 20 characters
-  - A asset href pointing to the relative path of the asset binary file into the S3 stagein bucket associated to the Collection
-  - A asset href path filename containing only the [a-zA-Z0-9._-] characters (the rest of the filename path is ignored). The path cannot point to a directory, only a file. The filename shall have maximum 100 characters.
+- Each asset of the STAC Item containing a local path as "href" is ingested, it shall thus have
+  - An asset href pointing to the relative path of the asset binary file into the S3 stagein bucket associated to the Collection
+  - An asset href filename containing only the [a-zA-Z0-9._-] characters (the rest of the filename path is ignored). The path cannot point to a directory, only a file. The filename shall have maximum 100 characters.
+  - An asset href filename unique among all the STAC Item assets (two assets in the same STAC item cannot have the same filename, even if they have different relative paths)
 
 The API response will contain, in case of success, the ingested STAC Item or a STAC ItemCollection (contianing the ingested STAC Item) as present in the Catalogue, thus with
 - Additional required metadata, including a link to the STAC Collection
@@ -110,7 +110,7 @@ Examples of API request and response are provided below. Please note that this A
       "id": "S3A_OPER_AUX_GNSSRD_POD__20171212T193142_V20160223T235943_20160224T225600",
       "assets": {
         "PRODUCT": {
-          "href": "http://myserver.com/Sentinel-3/S3A_OPER_AUX_GNSSRD_POD__20171212T193142_V20160223T235943_20160224T225600.tgz",
+          "href": "http://myserver.com/d/2015/05/19/S3A_OPER_AUX_GNSSRD_POD__20171212T193142_V20160223T235943_20160224T225600/S3A_OPER_AUX_GNSSRD_POD__20171212T193142_V20160223T235943_20160224T225600.tgz",
           "title": "Product",
           "type": "application/octet-stream",
         }
@@ -124,7 +124,7 @@ Examples of API request and response are provided below. Please note that this A
     {
       "assets": {
         "PRODUCT": {
-          "href": "http://myserver.com/Sentinel-3/S3A_OPER_AUX_GNSSRD_POD__20171212T193142_V20160223T235943_20160224T225600.tgz",
+          "href": "http://myserver.com/d/2015/05/19/S3A_OPER_AUX_GNSSRD_POD__20171212T193142_V20160223T235943_20160224T225600/S3A_OPER_AUX_GNSSRD_POD__20171212T193142_V20160223T235943_20160224T225600.tgz",
           "title": "Product",
           "type": "application/octet-stream"
         }
@@ -286,16 +286,14 @@ async def add_item_to_collection(assets_source: str, assets_dest: str, stac_dest
   #Destination for the asset is calculated using the collection and the asset start time if present. This is to not overload the file system with too many assets and have one unique way of representing assets in the datastore.
   assets_base_date=item_datetime_obj.strftime(f'%Y{os.sep}%m{os.sep}%d')
   assets_base_path=os.path.join(assets_base_date,i["id"])
-  assets_to_move=[]
+  assets_to_move_src=[]
+  assets_to_move_dst=[]
   if 'assets' in i:
     assets_dict=i['assets']
     for asset_key in assets_dict:
       asset=assets_dict[asset_key]
       #Skip URLs and assets who do not have HREF from the assets to be moved
       if 'href' in asset and '://' not in asset['href']:
-        #Check asset key is a valid asset name for a asset
-        if not valid_id_match(asset_key,lenmax=20):
-          return {"id":i['id'],"failure_reason":"Asset {asset_key} name is invalid. Only [a-zA-Z0-9._-] are allowed"}
         #Check if the assets exist in the storage
         staging_asset_path=os.path.join(assets_source,asset['href'])
         if not os.path.exists(staging_asset_path):
@@ -305,16 +303,23 @@ async def add_item_to_collection(assets_source: str, assets_dest: str, stac_dest
           return {"id":i['id'],"failure_reason":f"{asset_key} asset {asset['href']} is a link. Sharing of links is not supported"}
         if not os.path.isfile(staging_asset_path):
           return {"id":i['id'],"failure_reason":f"{asset_key} asset {asset['href']} is not a file. Sharing of directories is not supported"}
-        #Check asset asset file name is valid filename keys for a asset
+        #Check asset file name is valid filename keys for a asset
         staging_asset_filename=os.path.basename(staging_asset_path)
         if not valid_id_match(staging_asset_filename,lenmax=100):
-          return {"id":i['id'],"failure_reason":"Asset {asset_key} file name is invalid. Only [a-zA-Z0-9._-] are allowed"}
-        #Destination for the asset is calculated using the asset start time if present. This is to not overload the file system with too many assets
-        ds_asset_path=os.path.join(os.path.join(assets_base_path,asset_key),staging_asset_filename)
+          return {"id":i['id'],"failure_reason":f"Asset {asset_key} file name is invalid. Only [a-zA-Z0-9._-] are allowed"}
+        #Determine destination for the asset in the data store, this is used for both the access URL and the datastore destination path below
+        ds_asset_path=os.path.join(assets_base_path,staging_asset_filename)
         #Rewrite the asset URL to make it point to the stagein
         i['assets'][asset_key]['href']=datastore_url+ds_asset_path
         #Add the item in the lists of assets to be moved
-        assets_to_move.append((staging_asset_path,os.path.join(assets_dest,ds_asset_path)))
+        if staging_asset_path in assets_to_move_src:
+          #Skip this asset move, we already moved it before (to the same path)
+          continue
+        assets_to_move_src.append(staging_asset_path)
+        staging_asset_path_dest=os.path.join(assets_dest,ds_asset_path)
+        if staging_asset_path_dest in assets_to_move_dst:          
+          return {"id":i['id'],"failure_reason":f"Asset {asset_key} file name is not unique. Another asset in the product has the same file name"}
+        assets_to_move_dst.append(staging_asset_path_dest)
   
   #Post the STAC Item to the catalogue
   #Construct catalogue request
@@ -328,7 +333,6 @@ async def add_item_to_collection(assets_source: str, assets_dest: str, stac_dest
     return {"id":i['id'],"failure_reason":f"Catalogue refused STAC: {response_status}: {response_text}"}
   except URLError as e:
     response_status='URLError'
-    response_text=str(e)
     return {"id":i['id'],"failure_reason":f"Catalogue refused STAC: {response_status}: {response_text}"}
   except Exception as e:
     response_status='Exception'
@@ -347,17 +351,18 @@ async def add_item_to_collection(assets_source: str, assets_dest: str, stac_dest
     return {"id":i['id'],"failure_reason":f"Failed to store STAC in datastore: {response_status}: {response_text}"}
 
   #And move output
-  for asset in assets_to_move:
+  for idx,asset_src in enumerate(assets_to_move_src):
+    asset_dst=assets_to_move_dst[idx]
     try:
       #Move file
-      os.makedirs(os.path.dirname(asset[1]), exist_ok=True)
-      os.rename(asset[0],asset[1])
+      os.makedirs(os.path.dirname(asset_dst), exist_ok=True)
+      os.rename(asset_src,asset_dst)
       #Cleanup XATTR metadata (if any)
-      if os.path.exists(asset[0]+'.xattr'): os.remove(asset[0]+'.xattr')
+      if os.path.exists(asset_src+'.xattr'): os.remove(asset_src+'.xattr')
     except Exception as e:
       response_status='Exception'
       response_text=str(e)
-      return {"id":i['id'],"failure_reason":f"Failed to store asset {os.path.basename(asset[1])} in datastore: {response_status}: {response_text}"}
+      return {"id":i['id'],"failure_reason":f"Failed to store asset {os.path.basename(asset_dst)} in datastore: {response_status}: {response_text}"}
 
   #All ok, return the updated product
   return i
