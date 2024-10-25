@@ -87,6 +87,10 @@ To know how to use it, you can access the help on
 docker exec -it reg-api-server reg-api --help
 ```
 
+## API Usage
+
+The documentation on API usage is available, after the execution of the service, at the `/reg-api/docs/` address.
+
 ## Development
 
 The script `run_development` can be used during development to enable fastapi debugging and allow modifications of the `bin` and `src` directories to propagate within the docker container execution
