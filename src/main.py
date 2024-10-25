@@ -240,7 +240,7 @@ async def collection_items_post_request(
     response_status=201
     for ingested in ingested_items:
       if 'failure_reason' in ingested:
-        if response_body['failure_reason'] == 'Item already exists':
+        if ingested['failure_reason'] == 'Item already exists':
           response_status=409
         else:
           response_status=422
