@@ -1,4 +1,4 @@
 #!/bin/bash
 
 CURDIR="`readlink -f $0`"; CURDIR="${CURDIR%/*}"
-docker run -u `id -u`:`id -g` --name reg-api-server --network=host `bash $CURDIR/mountfolders_docker` -d --restart=always reg-api:latest
+docker run -u `id -u`:`id -g` --name reg-api-server --network=host `bash $CURDIR/mountfolders_docker` -d --restart=always reg-api:latest --root-path /reg-api
