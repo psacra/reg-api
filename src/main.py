@@ -17,7 +17,7 @@ import re
 import shutil
 
 #Setup FastAPI
-app = FastAPI(title="EOEPCA Registration Gateway",description="This application acts as a gateway for OGC Records - Transactions API, capturing requests and ensuring the assets contained in the Items to be registered are valid an stored into a proper storage location.",version="0.0.1")
+app = FastAPI(title="Registration Gateway",description="This application acts as a gateway for OGC Records - Transactions API, capturing requests and ensuring the assets contained in the Items to be registered are valid an stored into a proper storage location.",version="0.0.1")
 
 #Get current script execution path
 CURPATH = os.path.dirname(os.path.realpath(__file__))
@@ -93,7 +93,7 @@ The API response will contain, in case of success, the ingested STAC Item or a S
 - Additional required metadata, including a link to the STAC Collection
 - Rewritten asset links pointing to the datastore.
 
-The API response will contain, in case a STAC Item is posted, a JSON entry with the _id_ of the STAC Item to be ingested and a _failure_reason_ message, and in casea STAC ItemCollection is postd, a STAC ItemCollection containing the ingested STAC Items for the STAC Items ingested correctly and a JSON entry with the _id_ of the  STAC Item to be ingested and a _failure_reason_ message for the STAC Items which failed ingestion
+The API response will contain, in case of failure, a JSON entry with the _id_ of the STAC Item to be ingested and a _failure_reason_ message for the STAC Items which failed ingestion.
 
 Examples of API request and response are provided below. Please note that this API will require authorization.
   """,
