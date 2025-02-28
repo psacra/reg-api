@@ -1,0 +1,402 @@
+#!/bin/env python3
+
+#Basic imports
+import os, sys, json, argparse, tempfile, shutil, logging, subprocess
+
+#Get commandline input
+parser = argparse.ArgumentParser(prog='Registration API Gateway Client',
+                    description='Ingest data into the Registation API Gateway')
+
+parser.add_argument('product', type=str, nargs='+', help='Link to product to be ingested. See mode parameter for type of products supported.')
+parser.add_argument('-M','--mode', type=str, choices=['autodetect','item','asset','assetmerge','catalog','collection'], default='autodetect', help="Define what kind of input products are provided. 'item' mode will consider each input product to be a STAC Item, 'catalog' and 'collection' mode will consider input to be a STAC Catalog or Collection, 'asset' mode will consider each input product to be a single STAC Asset to be ingested as a single STAC Item, 'autodetect' mode is default and will determine for each input product if it is an 'item', a 'catalog', a 'collection' or an 'asset', 'assetmerge' will create one single STAC Item for all the input products assets")
+parser.add_argument('-c','--rapi-collection-id', type=str, help='Collection ID where products will be ingested. Defaults to the one in the STAC item [RAPI_COLLECTION_ID]')
+parser.add_argument('-u','--rapi-username', type=str, help='Data Provider Username. Can be provided via command line or envionment variable [RAPI_USERNAME]')
+parser.add_argument('-p','--rapi-password', type=str, help='Data Provider Password. Can be provided via command line or envionment variable [RAPI_PASSWORD]')
+parser.add_argument('-b','--rapi-stagein-bucket', type=str,  help='Data Provider S3 Stagein Bucket to use. Defaults to "sg-<username>-generic" [RAPI_STAGEIN_BUCKET]')
+
+parser.add_argument('--item-datetime', type=str, nargs=1, help='Override STAC Item datetime. Default is the one provided in the product STAC or the ingestion date time.')
+parser.add_argument('--item-ID', type=str, nargs=1, help='Override STAC Item ID. Default is the one provided in the product STAC or the product name without extenstion')
+parser.add_argument('--item-default-asset-type', type=str, nargs=1, help='STAC Item default asset type, if asset is provided in the input. Default is: application/octet-stream')
+
+parser.add_argument('--rapi-endpoint', type=str, default='https://eoresults.esa.int/reg-api/', help='Registration API Endpoint [RAPI_REGAPI_ENDPOINT]. Defaults to: https://eoresults.esa.int/reg-api/')
+parser.add_argument('--rapi-s3-endpoint', type=str, default='http://eoresults.esa.int', help='S3 Stagein Endpoint [RAPI_S3_ENDPOINT]. Default is eoresults.esa.int')
+parser.add_argument('--rapi-s3-region', type=str, default='us-east-1', help='S3 Stagein Endpoint Region [RAPI_S3_ENDPOINT_SSL]. Default is "us-east-1"')
+
+parser.add_argument('--assets-aws-access-key-id', type=str, help='For download of STAC Assets, use the given S3 access key ID')
+parser.add_argument('--assets-aws-secret-access-key', type=str, help='For download of STAC Assets, use the given S3 access key secret')
+parser.add_argument('--assets-aws-region', type=str, help='For download of STAC Assets, use the given S3 region') 
+parser.add_argument('--assets-aws-endpoint', type=str, help='For download of STAC Assets, use the given S3 endpoint (if not provided already in the s3:// URL)')
+parser.add_argument('--assets-http-basic-username', type=str, help='For download of STAC Assets, use the given HTTP Basic authentication username')
+parser.add_argument('--assets-http-basic-password', type=str, help='For download of STAC Assets, use the given HTTP Basic authentication password')
+parser.add_argument('--assets-http-authorization-token', type=str, help='For download of STAC Assets, use the given HTTP Basic Authorization head value')
+
+parser.add_argument('--s5cmd-path', type=str, help='Path to the s5cmd software, to be used for S3 upload/download')
+parser.add_argument('--curl-path', type=str, help='Path to the curl software, to be used for HTTP upload/download')
+parser.add_argument('--temporary-path', type=str, default=tempfile.gettempdir(), help='Temporary path for assets. Assets will be downloaded to this path before upload. This path need to be big enough to host the maximum asset size.')
+parser.add_argument('--continue-on-error', action='store_true', help='Continue ingestion even if there is an error on one Item/Asset. Default is to terminate all ingestion.')
+parser.add_argument('-C','--output-stac', action='store_true', help='Display the ingested STAC Items') 
+parser.add_argument('--verbose', '-v', action='count', default=0, help='Increase output verbosity. Default is INFO')
+parser.add_argument('--silent', '-s', action='count', default=0, help='Decrease output verbosity. Default is INFO')
+
+#Get arguments from environment variables
+args = vars(parser.parse_args())
+for k in args:
+  if k.startswith('rapi_'):
+    ku=k.upper()
+    if ku in os.environ:
+      args[k]=os.environ[ku]
+
+#Setup logging
+args['loglevel']=args['verbose']-args['silent']
+if args['loglevel']<=-2:
+  loglevel=logging.ERROR
+elif args['loglevel']==-1:
+  loglevel=logging.WARNING
+elif args['loglevel']>=1:
+  loglevel=logging.DEBUG
+else:
+  loglevel=logging.INFO
+logging.basicConfig(format='%(asctime)s[%(levelname)s]: %(message)s',level=loglevel)
+del loglevel
+
+#Check arguments and get default arguments
+if args['rapi_username'] is None:
+  logging.error("No Data Provider Username provided. See help!")
+  exit(1)
+if args['rapi_password'] is None:
+  logging.error("No Data Provider Password provided. See help!")
+  exit(1)
+if args['rapi_stagein_bucket'] is None:
+  args['rapi_stagein_bucket']=f"sg-{args['rapi_username']}-generic"
+  logging.info(f"No Data Provider S3 Stagein Bucket specified. Defaulting to {args['rapi_stagein_bucket']}")
+for dep_software in ['s5cmd','curl']:
+  logging.debug(f'Looking for {dep_software}')
+  sft_name=f'{dep_software}_path'
+  if args[sft_name] is None:
+    #Try to resolve the file path
+    args[sft_name]=shutil.which(dep_software)
+  if not args[sft_name]:
+    #Try to look in the local directory
+    args[sft_name]=os.path.join(os.path.dirname(os.path.realpath(__file__)),dep_software)
+  if not os.path.exists(args[sft_name]):
+    #Try to resolve the file path again
+    args[sft_name]=shutil.which(args[sft_name])
+  if not os.access(args[sft_name], os.X_OK):
+    #We did not find the software or is not an executable
+    logging.error(f"{dep_software} software does not exist or is not an executable. You can manually specify a {dep_software} path using the --{dep_software}-path flag or copy the executable within the client path!")
+    exit(1)
+  logging.debug(f'{dep_software} found on {args[sft_name]}')
+args['rapi_endpoint']+= 'collections/' if args['rapi_endpoint'].endswith('/') else '/collections/'
+
+#Create temporary directory
+class tmpDir:
+  def __init__(self, prefix, dir):
+    self.name = tempfile.mkdtemp(prefix=prefix,dir=dir)
+    logging.debug("Creating temporary directory "+self.name)
+  def cleanup(self):
+    logging.debug("Cleaning-up temporary directory "+self.name)
+    shutil.rmtree(self.name)
+    os.mkdir(self.name)
+  def __del__(self):
+    logging.debug("Deleting temporary directory "+self.name)
+    shutil.rmtree(self.name)
+dtmp=tmpDir(prefix='racd',dir=args['temporary_path'])
+
+####Support functions
+def product_download(src):
+  if src.startswith('http://') or src.startswith('https://'):
+    #This is an HTTP, use curl
+    dtmp.cleanup()
+    command=[args['curl_path'],'-O','-J','-L','--retry','5']
+    if args['loglevel'] < 0:
+      command+=['-s','-S']
+    elif args['loglevel'] == 0:
+      command.append('-#')
+    elif args['loglevel'] > 1:
+      command.append('-v')
+    if args['assets_http_basic_username'] is not None and args['assets_http_basic_password'] is not None: command+=['-u',f"{args['assets_http_basic_username']}:{args['assets_http_basic_password']}"]
+    if args['assets_http_authorization_token'] is not None: command+=['-H',f"authorization: {args['assets_http_authorization_token']}"]
+    command+=[src]
+    logging.debug(f'Running {command}')
+    try:
+      subprocess.run(command,cwd=dtmp.name,check=True)
+    except Exception as e:
+      logging.error(f"Error in subcommand execution. {e}. See above")
+      return None
+    dst=os.path.join(dtmp.name,os.listdir(dtmp.name)[0])
+  elif src.startswith('s3://'):
+    #This is an S3 link
+    dtmp.cleanup()
+    command=[args['s5cmd_path']]
+    s5cmd_env={}
+    if args['assets_aws_access_key_id'] is None:
+      if 'AWS_ACCESS_KEY_ID' in os.environ:
+        s5cmd_env['AWS_ACCESS_KEY_ID']=os.environ['AWS_ACCESS_KEY_ID']
+      else:
+        logging.error(f"Cannot find access key for asset download. Specify it via the AWS_ACCESS_KEY_ID environment variable or the --assets-aws-access-key-id parameter!")
+        return None
+    else:
+      s5cmd_env['AWS_ACCESS_KEY_ID']=args['assets_aws_access_key_id']
+    if args['assets_aws_secret_access_key'] is None:
+      if 'AWS_SECRET_ACCESS_KEY' in os.environ:
+        s5cmd_env['AWS_SECRET_ACCESS_KEY']=os.environ['AWS_SECRET_ACCESS_KEY']
+      else:
+        logging.error(f"Cannot find access key secret for asset download. Specify it via the AWS_SECRET_ACCESS_KEY environment variable or the --assets-aws-secret-access-key parameter!")
+        return None
+    else:
+      s5cmd_env['AWS_SECRET_ACCESS_KEY']=args['assets_aws_secret_access_key']
+    if args['assets_aws_region'] is not None: s5cmd_env['AWS_REGION']=args['assets_aws_region']
+    if args['assets_aws_endpoint'] is not None:
+      command+=['--endpoint-url',args['assets_aws_endpoint']]
+    elif '.' in src.split('/')[2]:
+      splitted_src=src.split('/')
+      command+=['--endpoint-url',splitted_src[2]]
+      logging.warning(f"Endpoint not specified in the --assets-aws-endpoint flag. Using {splitted_src[2]} from the product S3 link")
+      src='/'.join(splitted_src)
+    if args['loglevel']>=0:
+      command+=['--sp']
+    command+=['cp',src,dtmp.name+'/']
+    logging.debug(f'Running {command} with env {s5cmd_env}')
+    try:
+      subprocess.run(command,cwd=dtmp.name,check=True,env=s5cmd_env)
+    except Exception as e:
+      logging.error(f"Error in subcommand execution. {e}. See above")
+      return None
+    dst=os.path.join(dtmp.name,os.listdir(dtmp.name)[0])
+  elif src.startswith('file://'):
+    dst=src[7:]
+  else:
+    dst=src
+  if not os.path.exists(dst):
+    logging.error(f'Input product {dst} do not exists or is not accessible!')
+    return None
+  #Check if what you downloaded is a folder, if so, package it
+  if os.path.isdir(dst) or dst.endswith('/'):
+    logging.info(f'STAC Asset is a directory. Packaging it as a ZIP file')
+    dst_old=dst
+    dst=dst_old
+    if dst.ednswith('/'): dst[:-1]
+    dst=dst+'.zip'
+    shutil.make_archive(dst, 'zip', dst_old)
+  #Give always the absolute path back
+  return os.path.realpath(dst)
+def asset_upload(src,dst):
+  #Upload using S3
+  command=[args['s5cmd_path'],'--endpoint-url',args['rapi_s3_endpoint'],'cp']
+  if args['loglevel']>=0:
+    command+=['--sp']
+  command+=[src,f"s3://{args['rapi_stagein_bucket']}/{dst}"]
+  s5cmd_env={'AWS_ACCESS_KEY_ID':args['rapi_username'],'AWS_SECRET_ACCESS_KEY':args['rapi_password'],'AWS_REGION': args['rapi_s3_region']}
+  logging.debug(f'Running {command} with env {s5cmd_env}')
+  try:
+    subprocess.run(command,cwd=dtmp.name,check=True,env=s5cmd_env)
+  except Exception as e:
+    logging.error(f"Error in subcommand execution. {e}. See above")
+    return None
+  return dst
+def product_filename(src):
+  #Very basic filename extraction, to be extended
+  return os.path.basename(src)
+def create_stac_item(assetslist):
+  if 'item_datetime' in args and args['item_datetime']:
+    stacdatetime=args['item_datetime']
+  else:
+    stacdatetime=datetime.datetime.utcnow().strftime('%Y%m%dT%H%M%SZ')
+  if 'item_ID' in args and args['item_ID']:
+    stacid=args['item_ID']
+  else:
+    stacid=product_filename(assetslist[0])
+    stacid=stacid.rsplit('.',1)[0]
+  stacassets={}
+  assetnum=0
+  for asset in assetslist:
+    if assetnum>0:
+      assetid=f'PRODUCT{assetnum}'
+    else:
+      assetid='PRODUCT'
+    assetnum+=1
+    stacassets[assetid]={ "href": asset,"title": "Product","type": args['item_default_asset_type'] }
+  stac_item={"type": "Feature","stac_version": "1.0.0","stac_extensions": ["https://stac-extensions.github.io/alternate-assets/v1.1.0/schema.json","https://stac-extensions.github.io/storage/v1.0.0/schema.json"],"id": stacid, "properties": {"datetime": stacdatetime }, "assets": stacassets }
+  return stac_item
+def href_realpath(remotepath,localpath):
+  #If localpath is already an absolute path, just pass it back
+  if localpath[0]=='/' or '://' in localpath:
+    return localpath
+  #Use a relative path (but remove the scheme, if any)
+  return os.path.abspath('/'+remotepath+'/'+localpath).replace(':/','://',1)[1:]
+  
+def publish_stac(pd):
+  #Download the product
+  logging.debug(f"Downloading input product from {pd}")
+  product_local=product_download(pd)
+  if product_local is None:
+    logging.error(f"Failed to access {pd}")
+    return [{"id": "UNKNOWN", "failure_reason": f"Failed to access {pd}"}]
+  product_remotepath=os.path.dirname(pd)
+  #Load the STAC Item stac_item
+  if args['mode']=='asset':
+    #This is an asset, so create the STAC Item
+    logging.debug("Mode is asset. Creating STAC Item")
+    stac_item=create_stac_item([product_local])
+  else:
+    #Check if this is a valid STAC, otherwise we create the STAC
+    logging.debug("Loading STAC")
+    try:
+      with open(product_local,'r') as f:
+        stac_item=json.load(f)
+      #A STAC cannot be just a JSON, it needs to have also the following mandatory fields
+      if 'stac_version' not in stac_item:
+        raise Exception("stac_version metadata not found!")
+      if 'type' not in stac_item:
+        raise Exception("type metadata not found!")
+      if 'id' not in stac_item:
+        raise Exception("id metadata not found!")
+    except Exception as e:
+      #This is probably not a STAC, or it is an invalid STAC
+      if args['mode']=='autodetect':
+        logging.info(f'{pd} does not seem to be a STAC. {e}. Autodetect will consider it an asset!')
+        stac_item=create_stac_item([product_local])
+      else:
+        logging.error(f'{pd} does not seem to be a STAC Item. {e}. Cannot ingest it!')
+        return [{"id": "UNKNOWN", "failure_reason": f'{pd} does not seem to be a STAC Item. {e}.'}]
+    #Check if it is a catalog or a collection, then we recusively walk it
+    stac_item_type=stac_item['type'].lower()
+    logging.debug(f"STAC is of type {stac_item_type}")
+    if stac_item_type=='catalog' or stac_item_type=='collection':
+      #This is a collection of other stac items. We parse it recursively
+      if 'links' in stac_item:
+        published_stacs=[]
+        for stac_item_newpath in stac_item['links']:
+          if 'href' in stac_item_newpath and stac_item_newpath['href'] and 'rel' in stac_item_newpath and ( stac_item_newpath['rel']=='item' or stac_item_newpath['rel']=='collection' ):
+            logging.debug(f"Following STAC link {stac_item_newpath['href']}")
+            published_stacs+=publish_stac(href_realpath(product_remotepath,stac_item_newpath['href']))
+            if len(published_stacs)>0 and 'failure_reason' in published_stacs[-1]:
+              if args['continue_on_error']:
+                logging.warning(f"{pd} ingestion failed. Continuing with next product.")
+              else:
+                #No error display here, as it will come from the return
+                return published_stacs
+          else:
+            logging.debug(f"STAC link {stac_item_newpath} ignored!")
+        if len(published_stacs)==0:
+          logging.warning("STAC {stac_item_newpath} {pd} seems empty and will be ignored!")
+        return published_stacs
+      else:
+        logging.error(f"STAC {stac_item_type} has no links. Cannot ingest it!")
+        return  [{"id": stac_item['id'], "failure_reason": f'STAC {stac_item_type} has no links.'}]
+    elif stac_item_type!='feature':
+      #This is not supported
+      logging.error(f"STAC {pd} has unsupported type {stac_item_type}. Cannot be ingested!")
+      return  [{"id": stac_item['id'], "failure_reason": f'STAC {pd} has unsupported type {stac_item_type}.'}]
+  #Now we have a STAC Item stac_item, let's overwrite the collection or check the collection is defined
+  if args['rapi_collection_id'] is not None:
+    stac_item['collection']=args['rapi_collection_id']
+  elif 'collection' not in stac_item:
+    logging.error(f"STAC {pd} has no 'collection' metadata defined in the STAC item. Specify one via the --collection-id parameter!")
+    return  [{"id": stac_item['id'], "failure_reason": f'No collection specified'}]
+
+  #Upload all the assets
+  logging.debug("Uploding STAC Item assets...")
+  if 'assets' not in stac_item:
+    logging.error(f"STAC Item {pd} does not contain assets. Cannot be ingested!")
+    return  [{"id": stac_item['id'], "failure_reason": f"STAC Item {pd} does not contain assets."}]
+  stacassets=stac_item['assets']
+  for assetid in stacassets:
+    logging.debug(f"Downloading asset {assetid}...")
+    asset_localpath=product_download(href_realpath(product_remotepath,stacassets[assetid]['href']))
+    if asset_localpath is None:
+      logging.error(f"STAC Item {pd} ingestion failed. Asset {assetid} cannot be downloaded!")
+      return  [{"id": stac_item['id'], "failure_reason": f"Asset {assetid} download failed!"}]
+    asset_remotepath=os.path.basename(asset_localpath)
+    logging.debug(f"Uploading asset {assetid}...")
+    if asset_upload(asset_localpath,asset_remotepath) is None:
+      logging.error(f"STAC Item {pd} ingestion failed. Asset {assetid} cannot be uploaded!")
+      return  [{"id": stac_item['id'], "failure_reason": f"Asset {assetid} upload failed!"}]
+    stacassets[assetid]['href']=asset_remotepath
+
+  #Update the STAC Item and save it locally to be posted
+  dtmp.cleanup()
+  #Assets are the uploaded assets
+  stac_item['assets']=stacassets
+  #Links are to be removed (will be recreated by the catalogue)
+  if 'links' in stac_item: del stac_item['links']
+  #Remove also the collection (will be added again by the catalogue)
+  rapi_ingestion_endpoint=f"{args['rapi_endpoint']}{stac_item['collection']}/items"
+  del stac_item['collection']
+  #Save the STAC item to be ingested
+  stac_item_path=os.path.join(dtmp.name,'tbp.json')
+  with open(stac_item_path,'w') as f:
+    json.dump(stac_item,f)
+  #Ingest the STAC item
+  command=[args['curl_path'],'-X','POST','-T',stac_item_path,'-H','Content-Type: application/json','-u',f"{args['rapi_username']}:{args['rapi_password']}",rapi_ingestion_endpoint]
+  if args['loglevel'] < 0:
+    command+=['-s','-S']
+  elif args['loglevel'] == 0:
+    command.append('-#')
+  elif args['loglevel'] > 1:
+    command.append('-v')
+  logging.debug(f'Running {command} with stac "{json.dumps(stac_item)}"')
+  try:
+    res=subprocess.run(command,cwd=dtmp.name,check=True,stdout=subprocess.PIPE)
+  except Exception as e:
+    logging.error(f"Error in subcommand execution. {e}. See above")
+    return [{"id": stac_item['id'], "failure_reason": f"Error in reg-api call."}]
+
+  #Try to read the output message (which should be a JSON)
+  try:
+    ingested_stac_item=json.loads(res.stdout.decode('utf-8'))
+  except Exception as e:
+    logging.error(f"Error in reg-api call. Output is not a JSON")
+    return [{"id": stac_item['id'], "failure_reason": f"Error in reg-api call. Output is not a JSON"}]
+
+  #If this is an invalid output (does not contain ID nor failure reason, then it is a failure)
+  if 'id' not in ingested_stac_item:
+    logging.error(f"Error in reg-api call. Output is not what is expected (no ID included). Returned output is {ingested_stac_item}")
+    return [{"id": stac_item['id'], "failure_reason": f"Error in reg-api call. Output is not what is expected (no ID included). Returned output is {ingested_stac_item}"}]
+
+  return [ingested_stac_item]
+
+if args['mode']=='assetmerge':
+  logging.info("Mode is assetmerge, merging all asset links provided")
+  stac_assetmerge=create_stac_item(args['product'])
+  local_assetmerge=os.path.join(dtmp.name,'assetmerge.json')
+  with open(local_assetmerge,'w') as f:
+    json.dump(local_assetmerge,f)
+  args['product']=[local_assetmerge]
+
+published_stacs=[]
+for pd in args['product']:
+  logging.info(f"Publishing product {pd}")
+  published_stacs+=publish_stac(pd)
+  if len(published_stacs)>0 and 'failure_reason' in published_stacs[-1]:
+    if args['continue_on_error']:
+      logging.warning(f"{pd} ingestion failed. Continuing with next product.")
+    else:
+      logging.error(f"{pd} ingestion failed. Terminating.")
+      break
+
+#Determine the numer of failed items as errorcode
+errorcode=0
+for pubp in published_stacs:
+  if 'failure_reason' in pubp:
+    errorcode+=1
+
+#Display the final output
+logging.info(f"{len(published_stacs)-errorcode} items published correctly. {errorcode} failures.")
+if args['output_stac']:
+  #Display the published items
+  if len(published_stacs)==1:
+    #Just display the STAC Item
+    json.dump(published_stacs, sys.stdout, indent=2)
+  else:
+    #Create a STAC ItemCollection and display it
+    itemcoll={"type": "FeatureCollection","features":published_stacs}
+    json.dump(itemcoll, sys.stdout, indent=2)
+  #Determine the error code
+  for pubp in published_stacs:
+    if 'failure_reason' in pubp:
+      errorcode=2
+      break
+
+#All fine, exit
+exit(errorcode)
