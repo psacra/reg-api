@@ -1,7 +1,7 @@
 #!/bin/env python3
 
 #Basic imports
-import os, sys, json, argparse, tempfile, shutil, logging, subprocess
+import os, sys, json, argparse, tempfile, shutil, datetime, logging, subprocess
 
 #Get commandline input
 parser = argparse.ArgumentParser(prog='Registration API Gateway Client',
@@ -16,7 +16,7 @@ parser.add_argument('-b','--rapi-stagein-bucket', type=str,  help='Data Provider
 
 parser.add_argument('--item-datetime', type=str, nargs=1, help='Override STAC Item datetime. Default is the one provided in the product STAC or the ingestion date time.')
 parser.add_argument('--item-ID', type=str, nargs=1, help='Override STAC Item ID. Default is the one provided in the product STAC or the product name without extenstion')
-parser.add_argument('--item-default-asset-type', type=str, nargs=1, help='STAC Item default asset type, if asset is provided in the input. Default is: application/octet-stream')
+parser.add_argument('--item-default-asset-type', type=str, nargs=1, default='application/octet-stream', help='STAC Item default asset type, if asset is provided in the input. Default is: application/octet-stream')
 
 parser.add_argument('--rapi-endpoint', type=str, default='https://eoresults.esa.int/reg-api/', help='Registration API Endpoint [RAPI_REGAPI_ENDPOINT]. Defaults to: https://eoresults.esa.int/reg-api/')
 parser.add_argument('--rapi-s3-endpoint', type=str, default='http://eoresults.esa.int', help='S3 Stagein Endpoint [RAPI_S3_ENDPOINT]. Default is eoresults.esa.int')
@@ -149,13 +149,22 @@ def product_download(src):
     if args['assets_aws_endpoint'] is not None:
       command+=['--endpoint-url',args['assets_aws_endpoint']]
     elif '.' in src.split('/')[2]:
+      #Guess the HTTP endpoint address from the s3 url, https is assumed to be used
       splitted_src=src.split('/')
-      command+=['--endpoint-url',splitted_src[2]]
-      logging.warning(f"Endpoint not specified in the --assets-aws-endpoint flag. Using {splitted_src[2]} from the product S3 link")
+      command+=['--endpoint-url',f"https://{splitted_src[2]}"]
+      logging.warning(f"Endpoint not specified in the --assets-aws-endpoint flag. Using {command[-1]} from the product S3 link")
+      del splitted_src[2]
       src='/'.join(splitted_src)
+    command+=['cp']
     if args['loglevel']>=0:
       command+=['--sp']
-    command+=['cp',src,dtmp.name+'/']
+    #If we are copyiing a directory, add an * (s5cmd needs that)
+    outdir=dtmp.name+'/'
+    if src.endswith('/'):
+      #We are copyiing a directory, s5cmd needs an * and the directory name in the output
+      outdir+=src.rsplit('/',2)[-2]+'/'
+      src+='*'
+    command+=[src,outdir]
     logging.debug(f'Running {command} with env {s5cmd_env}')
     try:
       subprocess.run(command,cwd=dtmp.name,check=True,env=s5cmd_env)
@@ -172,12 +181,14 @@ def product_download(src):
     return None
   #Check if what you downloaded is a folder, if so, package it
   if os.path.isdir(dst) or dst.endswith('/'):
-    logging.info(f'STAC Asset is a directory. Packaging it as a ZIP file')
+    logging.info(f'STAC Asset is a directory. Packaging it as a ZIP file...')
     dst_old=dst
-    dst=dst_old
-    if dst.ednswith('/'): dst[:-1]
-    dst=dst+'.zip'
-    shutil.make_archive(dst, 'zip', dst_old)
+    if dst.endswith('/'): dst[:-1]
+    shutil.make_archive(dst, 'zip', dst)
+    logging.debug(f"Zip file {dst}.zip created. Deleting original directory now.")
+    shutil.rmtree(dst)
+    logging.debug(f"Old {dst} deleted.")
+    dst+='.zip'
   #Give always the absolute path back
   return os.path.realpath(dst)
 def asset_upload(src,dst):
@@ -227,6 +238,7 @@ def href_realpath(remotepath,localpath):
   
 def publish_stac(pd):
   #Download the product
+  logging.info(f"Publishing product {pd}")
   logging.debug(f"Downloading input product from {pd}")
   product_local=product_download(pd)
   if product_local is None:
@@ -366,7 +378,6 @@ if args['mode']=='assetmerge':
 
 published_stacs=[]
 for pd in args['product']:
-  logging.info(f"Publishing product {pd}")
   published_stacs+=publish_stac(pd)
   if len(published_stacs)>0 and 'failure_reason' in published_stacs[-1]:
     if args['continue_on_error']:
