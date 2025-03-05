@@ -8,7 +8,7 @@ There are three ways you can run install this client:
 
 1. locally, via python, installing s5cmd and curl dependencies
 2. as a Docker container, available at 
-3. as an [OGC Application Package](https://docs.ogc.org/bp/20-089r1.html), into a supported platform
+3. as a [CWL](https://www.commonwl.org/)/[OGC Application Package](https://docs.ogc.org/bp/20-089r1.html), into a supported platform
 
 ## Local
 
@@ -38,6 +38,25 @@ docker run eoepca/reg-api-client:latest --help
 ```
 
 ## OGC Application Package
+
+The [OGC Application Package](https://docs.ogc.org/bp/20-089r1.html) is a fully fledged [CWL](https://www.commonwl.org/) you can use to deploy and run your application into different platforms and infrastructure. Most notably, you can use:
+ - [CWLTool](https://github.com/common-workflow-language/cwltool) to run CWL locally
+ - [Toil](https://toil.readthedocs.io/en/latest/) to run CWL on an HPC cluster
+ - [OGC API Process Part 2](https://docs.ogc.org/DRAFTS/20-044.html) or the [OpenEO Community Standard UDF](https://open-eo.github.io/openeo-udf/) APIs to deploy and run on an Exploitation Platform
+
+### CWLTool
+
+Locally, after installing [CWLTool](https://github.com/common-workflow-language/cwltool?tab=readme-ov-file#install), you can run the [CWL file](./reg-api-client.cwl) provided in this repository via the following command
+
+```bash
+cwltool reg-api-client.cwl --collection PRR_TEST --password test --username test --product http://path/to/stac/to/ingest
+```
+
+### Toil
+
+You can install Toil and run the [CWL file](./reg-api-client.cwl) provided in this repository as any other CWL file. NOTE: Ensure you have docker available in your processing cluster.
+
+### Exploitation Platforms
 
 If the `reg-api-client` service is not already installed in your platform, deploy the OGC application package [CWL file](./reg-api-client.cwl) contained in this repository into a supported platform via [OGC API Process Part 2](https://docs.ogc.org/DRAFTS/20-044.html) or the [OpenEO Community Standard UDF](https://open-eo.github.io/openeo-udf/)
 

@@ -75,13 +75,13 @@ for dep_software in ['s5cmd','curl']:
   if args[sft_name] is None:
     #Try to resolve the file path
     args[sft_name]=shutil.which(dep_software)
-  if not args[sft_name]:
+  if args[sft_name] is None:
     #Try to look in the local directory
     args[sft_name]=os.path.join(os.path.dirname(os.path.realpath(__file__)),dep_software)
   if not os.path.exists(args[sft_name]):
     #Try to resolve the file path again
     args[sft_name]=shutil.which(args[sft_name])
-  if not os.access(args[sft_name], os.X_OK):
+  if args[sft_name] is None or not os.access(args[sft_name], os.X_OK):
     #We did not find the software or is not an executable
     logging.error(f"{dep_software} software does not exist or is not an executable. You can manually specify a {dep_software} path using the --{dep_software}-path flag or copy the executable within the client path!")
     exit(1)
@@ -212,7 +212,7 @@ def create_stac_item(assetslist):
   if 'item_datetime' in args and args['item_datetime']:
     stacdatetime=args['item_datetime']
   else:
-    stacdatetime=datetime.datetime.utcnow().strftime('%Y%m%dT%H%M%SZ')
+    stacdatetime=datetime.datetime.now(datetime.UTC).strftime('%Y%m%dT%H%M%SZ')
   if 'item_ID' in args and args['item_ID']:
     stacid=args['item_ID']
   else:
