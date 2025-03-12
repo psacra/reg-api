@@ -8,15 +8,16 @@ parser = argparse.ArgumentParser(prog='Registration API Gateway Client',
                     description='Ingest data into the Registation API Gateway')
 
 parser.add_argument('product', type=str, nargs='+', help='Link to product to be ingested. See mode parameter for type of products supported.')
-parser.add_argument('-M','--mode', type=str, choices=['autodetect','item','asset','assetmerge','catalog','collection'], default='autodetect', help="Define what kind of input products are provided. 'item' mode will consider each input product to be a STAC Item, 'catalog' and 'collection' mode will consider input to be a STAC Catalog or Collection, 'asset' mode will consider each input product to be a single STAC Asset to be ingested as a single STAC Item, 'autodetect' mode is default and will determine for each input product if it is an 'item', a 'catalog', a 'collection' or an 'asset', 'assetmerge' will create one single STAC Item for all the input products assets")
+parser.add_argument('-M','--mode', type=str, choices=['autodetect','item','asset','assetmerge','catalog','collection'], default='autodetect', help="Define what kind of input products are provided. 'item' mode will consider each input product to be a STAC Item, 'catalog' and 'collection' mode will consider input to be a STAC Catalog or Collection/FeatureCollection, 'asset' mode will consider each input product to be a single STAC Asset to be ingested as a single STAC Item, 'autodetect' mode is default and will determine for each input product if it is an 'item', a 'catalog', a 'collection' or an 'asset', 'assetmerge' will create one single STAC Item for all the input products assets")
 parser.add_argument('-c','--rapi-collection-id', type=str, help='Collection ID where products will be ingested. Defaults to the one in the STAC item [RAPI_COLLECTION_ID]')
 parser.add_argument('-u','--rapi-username', type=str, help='Data Provider Username. Can be provided via command line or envionment variable [RAPI_USERNAME]')
 parser.add_argument('-p','--rapi-password', type=str, help='Data Provider Password. Can be provided via command line or envionment variable [RAPI_PASSWORD]')
 parser.add_argument('-b','--rapi-stagein-bucket', type=str,  help='Data Provider S3 Stagein Bucket to use. Defaults to "sg-<username>-generic" [RAPI_STAGEIN_BUCKET]')
 
-parser.add_argument('--item-datetime', type=str, nargs=1, help='Override STAC Item datetime. Default is the one provided in the product STAC or the ingestion date time.')
-parser.add_argument('--item-ID', type=str, nargs=1, help='Override STAC Item ID. Default is the one provided in the product STAC or the product name without extenstion')
-parser.add_argument('--item-default-asset-type', type=str, nargs=1, default='application/octet-stream', help='STAC Item default asset type, if asset is provided in the input. Default is: application/octet-stream')
+parser.add_argument('--item-datetime', type=str, help='Override STAC Item datetime. Default is the one provided in the product STAC or the ingestion date time.')
+parser.add_argument('--item-ID', type=str, help='Override STAC Item ID. Default is the one provided in the product STAC or the product name without extenstion')
+parser.add_argument('--item-ID-regex', type=str, nargs=2, action='append', help='Apply a regular expression to the STAC Item ID before ingesting it. Useful to correct invalid IDs. Regex must be in python sub regex format, pattern and replacement to be separated by a space e.g. [^a-zA-Z0-9_-] _ will replace all invalid ID characheters with undersores. Multiple use of this argument are possible.')
+parser.add_argument('--item-default-asset-type', type=str, default='application/octet-stream', help='STAC asset type used in the STAC Item creation if the input is an asset. Default is: application/octet-stream')
 
 parser.add_argument('--rapi-endpoint', type=str, default='https://eoresults.esa.int/reg-api/', help='Registration API Endpoint [RAPI_REGAPI_ENDPOINT]. Defaults to: https://eoresults.esa.int/reg-api/')
 parser.add_argument('--rapi-s3-endpoint', type=str, default='http://eoresults.esa.int', help='S3 Stagein Endpoint [RAPI_S3_ENDPOINT]. Default is eoresults.esa.int')
@@ -209,15 +210,10 @@ def product_filename(src):
   #Very basic filename extraction, to be extended
   return os.path.basename(src)
 def create_stac_item(assetslist):
-  if 'item_datetime' in args and args['item_datetime']:
-    stacdatetime=args['item_datetime']
-  else:
-    stacdatetime=datetime.datetime.now(datetime.UTC).strftime('%Y%m%dT%H%M%SZ')
-  if 'item_ID' in args and args['item_ID']:
-    stacid=args['item_ID']
-  else:
-    stacid=product_filename(assetslist[0])
-    stacid=stacid.rsplit('.',1)[0]
+  #Default STAC IDs and datetimes. Will be overwritten later if specified by commandline
+  stacdatetime=datetime.datetime.now(datetime.timezone.utc).strftime('%Y%m%dT%H%M%SZ')
+  stacid=product_filename(assetslist[0])
+  stacid=stacid.rsplit('.',1)[0]
   stacassets={}
   assetnum=0
   for asset in assetslist:
@@ -306,7 +302,22 @@ def publish_stac(pd):
   elif 'collection' not in stac_item:
     logging.error(f"STAC {pd} has no 'collection' metadata defined in the STAC item. Specify one via the --collection-id parameter!")
     return  [{"id": stac_item['id'], "failure_reason": f'No collection specified'}]
-
+  #Override the STAC items parameters if requestd
+  if args['item_datetime'] is not None:
+    if 'datetime' in stac_item:
+      logging.debug(f"Replacing datetime from {stac_item['datetime']} to {args['item_datetime']}")
+    else:
+      logging.debug(f"Setting datetime to {args['item_datetime']}")
+    stac_item['datetime']=args['item_datetime']
+  if args['item_ID'] is not None:
+    logging.debug(f"Replacing id from {stac_item['id']} to {args['item_ID']}")
+    stac_item['id']=args['item_ID']
+  if args['item_ID_regex'] is not None:
+    import re
+    for r in args['item_ID_regex']:
+      logging.debug(f"Applying regular expression {r[0]} -> {r[1]} to ID")
+      stac_item['id']=re.sub(r[0],r[1],stac_item['id'])
+    logging.debug(f"New ID is {stac_item['id']}")
   #Upload all the assets
   logging.debug("Uploding STAC Item assets...")
   if 'assets' not in stac_item:
