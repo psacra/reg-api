@@ -1,4 +1,4 @@
 #!/bin/bash
 
 CURDIR="`readlink -f $0`"; CURDIR="${CURDIR%/*}"
-docker run --rm -u `id -u`:`id -g` --name reg-api-server-initdb `bash $CURDIR/mountfolders_docker` -it --entrypoint /bin/bash reg-api:latest -c reg-api initdb
+docker run --rm -u `id -u`:`id -g` --name reg-api-server-initdb `bash $CURDIR/mountfolders_docker` -it --entrypoint /usr/local/bin/python3 reg-api:latest /home/reg-api/bin/reg-api initdb

@@ -176,7 +176,7 @@ elif 'auth_action' in args_dict:
       log.error(f"STACs path {stacs_path} still does not exist, and it is mandatory. Exiting")
       exit(1)
   datastore_url=conf['datastore_external_url'].replace('{coll_id}',args.coll_id).replace('{stagein_bucket}',args.stagein_bucket)
-  cat_post_url=f"{conf['catalogue_address']}collections/{args.coll_id}/items"
+  cat_post_url=os.path.join(os.path.join(conf['catalogue_address'],args.coll_id),'items')
   extra_auths=0
   if args.allow_delete==1:
     extra_auths=1
@@ -218,19 +218,19 @@ elif 'coll_action' in args_dict:
 
   #Construct catalogue request
   if args.coll_action == 'add':
-    cat_req_url=f"{conf['catalogue_address']}collections/{conf['catalogue_main_collection']}/items"
+    cat_req_url=conf['catalogue_address'].rstrip('/')
     log.info(f"POST {collection_json} to {cat_req_url}...")
     req = Request(cat_req_url, coll_data, headers={'Content-Type':'application/geo+json'}, method='POST')
   elif args.coll_action == 'del':
-    cat_req_url=f"{conf['catalogue_address']}collections/{conf['catalogue_main_collection']}/items/{args.coll_id}"
+    cat_req_url=os.path.join(conf['catalogue_address'],args.coll_id)
     log.info(f"DELETE {args.coll_id} to {cat_req_url}...")
     req = Request(cat_req_url, headers={'Content-Type':'application/geo+json'}, method='DELETE')
   elif args.coll_action == 'update':
-    cat_req_url=f"{conf['catalogue_address']}collections/{conf['catalogue_main_collection']}/items/{args.coll_id}"
+    cat_req_url=os.path.join(conf['catalogue_address'],args.coll_id)
     log.info(f"PUT {args.coll_id} to {cat_req_url}...")
     req = Request(cat_req_url, coll_data, headers={'Content-Type':'application/geo+json'}, method='PUT')
   elif args.coll_action == 'check':
-    cat_req_url=f"{conf['catalogue_address']}collections/{conf['catalogue_main_collection']}/items/{args.coll_id}"
+    cat_req_url=os.path.join(conf['catalogue_address'],args.coll_id)
     log.info(f"GET {args.coll_id} from {cat_req_url}...")
     req = Request(cat_req_url, coll_data, headers={'Content-Type':'application/geo+json'}, method='GET')
   else:

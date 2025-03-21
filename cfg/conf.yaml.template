@@ -18,9 +18,7 @@ config:
   #via an HTTP or S3 interface
   assets_subfolder: assets
   #This is the address of the catalogue where the STAC items will be posted
-  catalogue_address: http://mycatalogue:8000/
-  #This is the catalogue main STAC catalogue endopoint where the collections will be created
-  catalogue_main_collection: metadata:main
+  catalogue_address: http://mycatalogue:8000/collections
   #This is the URL to which the assets_folder is exported for download of the assets.
   #This URL will be used by the software to create assets download links for the
   #assets stored into the assets_folder path

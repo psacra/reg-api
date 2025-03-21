@@ -268,6 +268,9 @@ async def add_item_to_collection(assets_source: str, assets_dest: str, stac_dest
   if 'links' not in i:
     #Add default empty links
     i['links']=[]
+  if 'geometry' not in i:
+    #Add default empty geometry
+    i['geometry']=None
   if 'properties' not in i:
     return {"id":i['id'],"failure_reason":"Missing required property field from the STAC JSON"}
   if 'datetime' not in i['properties'] or i['properties']['datetime'] is None:
