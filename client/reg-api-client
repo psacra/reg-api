@@ -8,7 +8,7 @@ parser = argparse.ArgumentParser(prog='Registration API Gateway Client',
                     description='Ingest data into the Registation API Gateway')
 
 parser.add_argument('product', type=str, nargs='+', help='Link to product to be ingested. See mode parameter for type of products supported.')
-parser.add_argument('-M','--mode', type=str, choices=['autodetect','item','asset','assetmerge','catalog','collection'], default='autodetect', help="Define what kind of input products are provided. 'item' mode will consider each input product to be a STAC Item, 'catalog' and 'collection' mode will consider input to be a STAC Catalog or Collection/FeatureCollection, 'asset' mode will consider each input product to be a single STAC Asset to be ingested as a single STAC Item, 'autodetect' mode is default and will determine for each input product if it is an 'item', a 'catalog', a 'collection' or an 'asset', 'assetmerge' will create one single STAC Item for all the input products assets")
+parser.add_argument('-M','--mode', type=str, choices=['autodetect','asset','assetmerge','stac'], default='autodetect', help="Define what kind of input products are provided. 'stac' mode will consider each input product to be a valid STAC (Item, Catalogue, Collection or FeatureCollection), an error will be thrown if STAC is not valid. 'asset' mode will consider each input product to be a single STAC Asset to be ingested as a single STAC Item,  'assetmerge' will create one single STAC Item for all the input products assets, 'autodetect' mode is default and will try to load the item as a STAC. If invalid, it will threat it as an asset.")
 parser.add_argument('-c','--rapi-collection-id', type=str, help='Collection ID where products will be ingested. Defaults to the one in the STAC item [RAPI_COLLECTION_ID]')
 parser.add_argument('-u','--rapi-username', type=str, help='Data Provider Username. Can be provided via command line or envionment variable [RAPI_USERNAME]')
 parser.add_argument('-p','--rapi-password', type=str, help='Data Provider Password. Can be provided via command line or envionment variable [RAPI_PASSWORD]')
@@ -247,35 +247,41 @@ def publish_stac(pd):
     logging.debug("Mode is asset. Creating STAC Item")
     stac_item=create_stac_item([product_local])
   else:
-    #Check if this is a valid STAC, otherwise we create the STAC
+    #Load the STAC as a JSON, if you can
     logging.debug("Loading STAC")
     try:
       with open(product_local,'r') as f:
         stac_item=json.load(f)
-      #A STAC cannot be just a JSON, it needs to have also the following mandatory fields
-      if 'stac_version' not in stac_item:
-        raise Exception("stac_version metadata not found!")
-      if 'type' not in stac_item:
-        raise Exception("type metadata not found!")
-      if 'id' not in stac_item:
-        raise Exception("id metadata not found!")
     except Exception as e:
       #This is probably not a STAC, or it is an invalid STAC
       if args['mode']=='autodetect':
         logging.info(f'{pd} does not seem to be a STAC. {e}. Autodetect will consider it an asset!')
         stac_item=create_stac_item([product_local])
       else:
-        logging.error(f'{pd} does not seem to be a STAC Item. {e}. Cannot ingest it!')
+        logging.error(f'{pd} does not seem to be a STAC. {e}. Cannot ingest it!')
         return [{"id": "UNKNOWN", "failure_reason": f'{pd} does not seem to be a STAC Item. {e}.'}]
-    #Check if it is a catalog or a collection, then we recusively walk it
+    #Check the STAC is valid
+    #type is mandatory
+    if 'type' not in stac_item:
+      logging.error(f'{pd} is a JSON but an invlid STAC (no type metadata present). Cannot ingest it! Force the mode to be "asset" if you want to ingest it as a binary')
+      return [{"id": "UNKNOWN", "failure_reason": f'{pd} is invalid. No type metadata present.'}]
     stac_item_type=stac_item['type'].lower()
     logging.debug(f"STAC is of type {stac_item_type}")
+    #stac_version is mandatory except than for FeatureCollection items
+    if 'stac_version' not in stac_item and stac_item_type!='featurecollection':
+      logging.error(f'{pd} is a JSON but an invlid STAC (no stac_version metadata present). Cannot ingest it! Force the mode to be "asset" if you want to ingest it as a binary')
+      return [{"id": "UNKNOWN", "failure_reason": f'{pd} is invalid. No stac_version metadata present.'}]
+    #id is mandatory except for FeatureCollection items
+    if 'id' not in stac_item and stac_item_type!='featurecollection':
+      logging.error(f'{pd} is a JOSN but an invlid STAC (no id metadata present). Cannot ingest it! Force the mode to be "asset" if you want to ingest it as a binary')
+      return [{"id": "UNKNOWN", "failure_reason": f'{pd} is invalid. No id metadata present.'}]
+    #According to the type of the STAC, we parse it
     if stac_item_type=='catalog' or stac_item_type=='collection':
       #This is a collection of other stac items. We parse it recursively
       if 'links' in stac_item:
         published_stacs=[]
         for stac_item_newpath in stac_item['links']:
-          if 'href' in stac_item_newpath and stac_item_newpath['href'] and 'rel' in stac_item_newpath and ( stac_item_newpath['rel']=='item' or stac_item_newpath['rel']=='collection' ):
+          if 'href' in stac_item_newpath and stac_item_newpath['href'] and 'rel' in stac_item_newpath and ( stac_item_newpath['rel']=='item' or stac_item_newpath['rel']=='collection' or stac_item_newpath['rel']=='next' or stac_item_newpath['rel']=='items' ):
             logging.debug(f"Following STAC link {stac_item_newpath['href']}")
             published_stacs+=publish_stac(href_realpath(product_remotepath,stac_item_newpath['href']))
             if len(published_stacs)>0 and 'failure_reason' in published_stacs[-1]:
@@ -287,11 +293,55 @@ def publish_stac(pd):
           else:
             logging.debug(f"STAC link {stac_item_newpath} ignored!")
         if len(published_stacs)==0:
-          logging.warning("STAC {stac_item_newpath} {pd} seems empty and will be ignored!")
+          logging.warning(f"STAC {pd} seems empty and will be ignored!")
         return published_stacs
       else:
         logging.error(f"STAC {stac_item_type} has no links. Cannot ingest it!")
         return  [{"id": stac_item['id'], "failure_reason": f'STAC {stac_item_type} has no links.'}]
+
+    elif stac_item_type=='featurecollection':
+      #If it is a featurecollection, then we ingest its features
+      if 'features' in stac_item:
+        published_stacs=[]
+        for stac_item_new in stac_item['features']:
+          #We re-download the STAC feature from the 'self' link, because this ensures us we are getting all metadata and assets
+          stac_item_selflink=''
+          if 'links' in stac_item_new:
+            for stac_item_newpath in stac_item_new['links']:
+              if 'href' in stac_item_newpath and stac_item_newpath['href'] and 'rel' in stac_item_newpath and stac_item_newpath['rel']=='self':
+                stac_item_selflink=href_realpath(product_remotepath,stac_item_newpath['href'])
+                break
+          if stac_item_selflink=='':
+            if 'id' in stac_item_new:
+              stac_item_selflink_id=stac_item_new['id']
+            else:
+              stac_item_selflink_id='UNKNOWN'
+            logging.error(f"Feature {stac_item_selflink_id} in FeatureCollection {pd} has no self link. It cannot be ingested")
+            return  [{"id": stac_item_selflink_id, "failure_reason": f'Feature has no self link.'}]
+          published_stacs+=publish_stac(stac_item_selflink)
+          if len(published_stacs)>0 and 'failure_reason' in published_stacs[-1]:
+            if args['continue_on_error']:
+              logging.warning(f"{pd} ingestion failed. Continuing with next product.")
+            else:
+              #No error display here, as it will come from the return
+              return published_stacs
+      else:
+        logging.warning("No features present in stac FeatureCollection {pd}. Nothing to ingest")
+        published_stacs=[]
+      #Follow-up the next items links
+      if 'links' in stac_item:
+        for stac_item_newpath in stac_item['links']:
+          if 'href' in stac_item_newpath and stac_item_newpath['href'] and 'rel' in stac_item_newpath and stac_item_newpath['rel']=='next':
+            logging.debug(f"Following STAC link {stac_item_newpath['href']}")
+            published_stacs+=publish_stac(href_realpath(product_remotepath,stac_item_newpath['href']))
+            if len(published_stacs)>0 and 'failure_reason' in published_stacs[-1]:
+              if args['continue_on_error']:
+                logging.warning(f"{pd} ingestion failed. Continuing with next product.")
+              else:
+                #No error display here, as it will come from the return
+                return published_stacs
+      #Finally, return the published STAC items
+      return published_stacs
     elif stac_item_type!='feature':
       #This is not supported
       logging.error(f"STAC {pd} has unsupported type {stac_item_type}. Cannot be ingested!")
