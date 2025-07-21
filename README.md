@@ -54,7 +54,7 @@ cd reg-api
 Edit the configuration file according to your installation paths (see comments in the configuration file template)
 
 ```
-cp cfg/onf.yaml.template cfg/conf.yaml
+cp cfg/conf.yaml.template cfg/conf.yaml
 vi cfg/conf.yaml
 ```
 
