@@ -71,31 +71,31 @@ async def validation_exception_handler(request, exc):
 
 @app.post(
   "/collections/{collectionId}/items",
-  tags=["Implemented tranaction operations:"],
+  tags=["Implemented transaction operations:"],
   summary="Register an Item or an ItemCollection",
   description="""This call performs a registration of a [STAC Item](https://github.com/radiantearth/stac-spec/blob/master/item-spec/item-spec.md) or [STAC ItemCollection](https://github.com/radiantearth/stac-api-spec/tree/release/v1.0.0/fragments/itemcollection) (a set of STAC Items) into the Catalogue.
 
 To access it, you need to be registered as Data Provider and authorized to publish in the Catalogue collection (_{collectionId}_ in the API endpoint path).
 
-The POST request body need to contain the STAC Item or the STAC ItemCollection to be published.
+The POST request body needs to contain the STAC Item or the STAC ItemCollection to be published.
 
 The STAC Item or STAC ItemCollection to be published needs to respect the following constraints:
-- It needs to be a valid STAC Items, according to the [STAC Item Specifications](https://github.com/radiantearth/stac-spec/blob/master/item-spec/item-spec.md), or a valid STAC ItemCollection, according to the [STAC ItemCollection Specifications](https://github.com/radiantearth/stac-api-spec/tree/release/v1.0.0/fragments/itemcollection), containing valid STAC Items inside
+- It needs to be a valid STAC Item, according to the [STAC Item Specifications](https://github.com/radiantearth/stac-spec/blob/master/item-spec/item-spec.md), or a valid STAC ItemCollection, according to the [STAC ItemCollection Specifications](https://github.com/radiantearth/stac-api-spec/tree/release/v1.0.0/fragments/itemcollection), containing valid STAC Items inside
 - If a _collection_ metadata is present, it needs to contain the same value as _{collectionId}_. If it is not present, it will be added with the same value as _{collectionId}_
 - The _id_ metadata can contain only the [a-zA-Z0-9._-] characters and shall have maximum 100 characters.
-- Each asset of the STAC Item containing an URI as "href" is ingored and will be posted into the Catalogue as-is
-- Each asset of the STAC Item containing a local path as "href" is ingested, it shall thus have
-  - An asset href pointing to the relative path of the asset binary file into the S3 stagein bucket associated to the Collection
+- Each asset of the STAC Item containing a URI as "href" is ignored and will be posted into the Catalogue as-is
+- Each asset of the STAC Item containing a local path as "href" is ingested. It shall thus have:
+  - An asset href pointing to the relative path of the asset binary file in the S3 stagein bucket associated to the Collection
   - An asset href filename containing only the [a-zA-Z0-9._-] characters (the rest of the filename path is ignored). The path cannot point to a directory, only a file. The filename shall have maximum 100 characters.
   - An asset href filename unique among all the STAC Item assets (two assets in the same STAC item cannot have the same filename, even if they have different relative paths)
 
-The API response will contain, in case of success, the ingested STAC Item or a STAC ItemCollection (contianing the ingested STAC Item) as present in the Catalogue, thus with
+The API response will contain, in case of success, the ingested STAC Item or a STAC ItemCollection (containing the ingested STAC Item) as present in the Catalogue, thus with
 - Additional required metadata, including a link to the STAC Collection
 - Rewritten asset links pointing to the datastore.
 
 The API response will contain, in case of failure, a JSON entry with the _id_ of the STAC Item to be ingested and a _failure_reason_ message for the STAC Items which failed ingestion.
 
-Examples of API request and response are provided below. Please note that this API will require authorization.
+Examples of API request and response are provided below. Please note that this API operation will require authorization.
   """,
   status_code=201,
   responses={
@@ -143,7 +143,7 @@ Examples of API request and response are provided below. Please note that this A
 }
     }
     }}}},
-    409: {"description": "Conflict. Failed to add one or more items because items already exists","content":{"application/json":{"examples":{"Item":{"value":
+    409: {"description": "Conflict. Failed to add one or more items because items already exist","content":{"application/json":{"examples":{"Item":{"value":
       {"id": "the id of the item which already exists",
        "failure_reason": "Item already exists"}
     },"ItemCollection":{"value":
@@ -264,7 +264,7 @@ async def add_item_to_collection(assets_source: str, assets_dest: str, stac_dest
   if 'collection' not in i:
     i['collection']=collectionId
   elif i['collection']!=collectionId:
-    return {"id":i['id'],"failure_reason":"Collection ID contianed in the STAC JSON is different from the one in the POST"}
+    return {"id":i['id'],"failure_reason":"Collection ID contained in the STAC JSON is different from the one in the POST"}
   if 'links' not in i:
     #Add default empty links
     i['links']=[]
@@ -374,7 +374,7 @@ async def add_item_to_collection(assets_source: str, assets_dest: str, stac_dest
   "/collections/{collectionId}/items/{recordId}",
   tags=["Implemented tranaction operations:"],
   summary="Delete an Item or an ItemCollection from a collection",
-  description="""This callows allows to **delete** a STAC Item or ItemCollection from the catalogue and datastore.
+  description="""This call allows to **delete** a STAC Item or ItemCollection from the catalogue and datastore.
 
 Please note that this action cannot be reversed, and it will delete all the assets from the catalogue and datastore including all backups. It should be used with lots of caution and for testing only.
 
@@ -472,12 +472,12 @@ async def collection_items_del_request(
   if os.path.exists(stacs_path_to_delete):
     os.remove(stacs_path_to_delete)
   else:
-    failure_reason='Cannot delete STAC Item backup. It does not exists.'
+    failure_reason='Cannot delete STAC Item backup. It does not exist.'
   #Delete STAC assets
   if os.path.exists(assets_path_to_delete):
     shutil.rmtree(assets_path_to_delete)
   else:
-    failure_reason=failure_reason+'Cannot delete STAC Item Assets. They do not exists.'
+    failure_reason=failure_reason+'Cannot delete STAC Item Assets. They do not exist.'
 
   #Return result
   if failure_reason=='':
