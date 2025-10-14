@@ -1,20 +1,21 @@
 #!/bin/env python3
 
 #Basic imports
-import os, sys, json, argparse, tempfile, shutil, datetime, logging, subprocess
+import os, sys, json, argparse, tempfile, shutil, datetime, logging, subprocess, re
 
 #Get commandline input
 parser = argparse.ArgumentParser(prog='Registration API Gateway Client',
                     description='Ingest data into the Registation API Gateway')
 
 parser.add_argument('product', type=str, nargs='+', help='Link to product to be ingested. See mode parameter for type of products supported.')
-parser.add_argument('-M','--mode', type=str, choices=['autodetect','asset','assetmerge','stac'], default='autodetect', help="Define what kind of input products are provided. 'stac' mode will consider each input product to be a valid STAC (Item, Catalogue, Collection or FeatureCollection), an error will be thrown if STAC is not valid. 'asset' mode will consider each input product to be a single STAC Asset to be ingested as a single STAC Item,  'assetmerge' will create one single STAC Item for all the input products assets, 'autodetect' mode is default and will try to load the item as a STAC. If invalid, it will threat it as an asset.")
+parser.add_argument('-M','--mode', type=str, choices=['autodetect','asset','assetmerge','stac'], default='autodetect', help="Define what kind of input products are provided. 'stac' mode will consider each input product to be a valid STAC (Item, Catalogue, Collection or FeatureCollection), an error will be thrown if STAC is not valid. 'asset' mode will consider each input product to be a single STAC Asset to be ingested as a single STAC Item,  'assetmerge' will create one single STAC Item for all the input products assets, 'autodetect' mode is default and will try to load the item as a STAC. If invalid, it will treat it as an asset.")
 parser.add_argument('-c','--rapi-collection-id', type=str, help='Collection ID where products will be ingested. Defaults to the one in the STAC item [RAPI_COLLECTION_ID]')
 parser.add_argument('-u','--rapi-username', type=str, help='Data Provider Username. Can be provided via command line or envionment variable [RAPI_USERNAME]')
 parser.add_argument('-p','--rapi-password', type=str, help='Data Provider Password. Can be provided via command line or envionment variable [RAPI_PASSWORD]')
 parser.add_argument('-b','--rapi-stagein-bucket', type=str,  help='Data Provider S3 Stagein Bucket to use. Defaults to "sg-<username>-generic" [RAPI_STAGEIN_BUCKET]')
 
-parser.add_argument('--item-datetime', type=str, help='Override STAC Item datetime or start/end.The default values are the ones provided in the product STAC or the ingestion date time. Format: YYYY-MM-DDTHH:MM:SSZ or YYYY-MM-DDTHH:MM:SSZ/YYYY-MM-DDTHH:MM:SSZ . If only one datetime is provided, it will be used as start_datetime and end_datetime. If two datetimes are provided, the first will be used as start_datetime and the second as end_datetime. ')
+parser.add_argument('--item-datetime', type=str, help='Override STAC Item datetime or start/end. The default values are the ones provided in the product STAC or the ingestion date time. Format: YYYY-MM-DDTHH:MM:SSZ or YYYY-MM-DDTHH:MM:SSZ/YYYY-MM-DDTHH:MM:SSZ . If only one datetime is provided, it will be used as start_datetime and end_datetime. If two datetimes are provided, the first will be used as start_datetime and the second as end_datetime. ')
+parser.add_argument('--item-datetime-regex', type=str, help='Regex to extract datetime from product filename. Use named groups: sY, sm, sD, sH, sM, sS for start; eY, em, eD, eH, eM, eS for end.')
 parser.add_argument('--item-ID', type=str, help='Override STAC Item ID. Default is the one provided in the product STAC or the product name without extenstion')
 parser.add_argument('--item-ID-regex', type=str, nargs=2, action='append', help='Apply a regular expression to the STAC Item ID before ingesting it. Useful to correct invalid IDs. Regex must be in python sub regex format, pattern and replacement to be separated by a space e.g. [^a-zA-Z0-9_-] _ will replace all invalid ID characheters with undersores. Multiple use of this argument are possible.')
 parser.add_argument('--item-default-asset-type', type=str, default='application/octet-stream', help='STAC asset type used in the STAC Item creation if the input is an asset. Default is: application/octet-stream')
@@ -241,6 +242,53 @@ def parse_item_datetime(dt_str):
     return start, end
   return dt_str, dt_str
 
+def extract_datetime_from_filename(product, regex):
+  dts = re.compile(regex).search(product)
+  if not dts:
+    logging.error("Datetime regex did not match product filename.")
+    return None, None
+  dts = dts.groupdict()
+  # Start date
+  try:
+    if 'sY' not in dts:
+      logging.error("Regex must provide at least 'sY' (start year).")
+      return None, None
+    sY = int(dts['sY'])
+    sm = int(dts.get('sm', 1))
+    sD = int(dts.get('sD', 1))
+    sH = int(dts.get('sH', 0))
+    sM = int(dts.get('sM', 0))
+    sS = int(dts.get('sS', 0))
+    startDate = datetime.datetime(sY, sm, sD, sH, sM, sS)
+  except Exception as e:
+    logging.error(f"Error parsing start datetime: {e}")
+    return None, None
+  # End date
+  try:
+    if 'eY' not in dts:
+      endDate = startDate
+    else:
+      eY = int(dts['eY'])
+      em = int(dts.get('em', 12))
+      # Days in month
+      if 'eD' not in dts:
+        if em == 2:
+          eD = 28
+        elif em in [11, 4, 7, 9]:
+          eD = 30
+        else:
+          eD = 31
+      else:
+        eD = int(dts['eD'])
+      eH = int(dts.get('eH', 23))
+      eM = int(dts.get('eM', 59))
+      eS = int(dts.get('eS', 59))
+      endDate = datetime.datetime(eY, em, eD, eH, eM, eS)
+  except Exception as e:
+    logging.error(f"Error parsing end datetime: {e}")
+    endDate = startDate
+  return startDate.strftime('%Y-%m-%dT%H:%M:%SZ'), endDate.strftime('%Y-%m-%dT%H:%M:%SZ')
+
 def publish_stac(pd):
   #Download the product
   logging.info(f"Publishing product {pd}")
@@ -361,6 +409,17 @@ def publish_stac(pd):
   elif 'collection' not in stac_item:
     logging.error(f"STAC {pd} has no 'collection' metadata defined in the STAC item. Specify one via the --collection-id parameter!")
     return  [{"id": stac_item['id'], "failure_reason": f'No collection specified'}]
+  # Override datetime from filename regex if requested
+  if args.get('item_datetime_regex'):
+    start_dt, end_dt = extract_datetime_from_filename(product_filename(pd), args['item_datetime_regex'])
+    if start_dt and end_dt:
+      if 'properties' not in stac_item:
+        stac_item['properties'] = {}
+      stac_item['properties']['start_datetime'] = start_dt
+      stac_item['properties']['end_datetime'] = end_dt
+      if 'datetime' in stac_item['properties']:
+        del stac_item['properties']['datetime']
+      logging.debug(f"Set start_datetime to {start_dt} and end_datetime to {end_dt} from filename regex")
   #Override the STAC items parameters if requested
   if args['item_datetime'] is not None:
     start_dt, end_dt = parse_item_datetime(args['item_datetime'])
@@ -372,7 +431,7 @@ def publish_stac(pd):
       # Remove old 'datetime' if present
       if 'datetime' in stac_item['properties']:
         del stac_item['properties']['datetime']
-      logging.debug(f"Set start_datetime to {start_dt} and end_datetime to {end_dt}")
+      logging.debug(f"Set start_datetime to {start_dt} and end_datetime to {end_dt}") 
   if args['item_ID'] is not None:
     logging.debug(f"Replacing id from {stac_item['id']} to {args['item_ID']}")
     stac_item['id']=args['item_ID']
