@@ -1,7 +1,7 @@
 #!/bin/env python3
 
 #Basic imports
-import os, sys, json, argparse, tempfile, shutil, datetime, logging, subprocess, re
+import os, sys, json, argparse, tempfile, shutil, datetime, logging, subprocess, re, hashlib
 
 #Get commandline input
 parser = argparse.ArgumentParser(prog='Registration API Gateway Client',
@@ -39,6 +39,7 @@ parser.add_argument('--continue-on-error', action='store_true', help='Continue i
 parser.add_argument('-C','--output-stac', action='store_true', help='Display the ingested STAC Items') 
 parser.add_argument('--verbose', '-v', action='count', default=0, help='Increase output verbosity. Default is INFO')
 parser.add_argument('--silent', '-s', action='count', default=0, help='Decrease output verbosity. Default is INFO')
+parser.add_argument('--add-checksum', action='store_true', help='Add a multihash checksum for each asset using SHA2-256 and standard hashlib.')
 
 #Get arguments from environment variables
 args = vars(parser.parse_args())
@@ -289,6 +290,17 @@ def extract_datetime_from_filename(product, regex):
     endDate = startDate
   return startDate.strftime('%Y-%m-%dT%H:%M:%SZ'), endDate.strftime('%Y-%m-%dT%H:%M:%SZ')
 
+def compute_multihash_sha256(filepath):
+  # Multihash format: <hash code><digest length><digest>
+  # SHA2-256 code: 0x12, digest length: 32 bytes
+  hash_func = hashlib.sha256()
+  with open(filepath, 'rb') as f:
+    for chunk in iter(lambda: f.read(8192), b''):
+      hash_func.update(chunk)
+  digest = hash_func.digest()
+  multihash_bytes = b'\x12' + bytes([len(digest)]) + digest
+  return multihash_bytes.hex()
+
 def publish_stac(pd):
   #Download the product
   logging.info(f"Publishing product {pd}")
@@ -460,6 +472,12 @@ def publish_stac(pd):
       return  [{"id": stac_item['id'], "failure_reason": f"Asset {assetid} upload failed!"}]
     stacassets[assetid]['href']=asset_remotepath
 
+    # Add checksum if requested
+    if args.get('add_checksum'):
+      checksum = compute_multihash_sha256(asset_localpath)
+      stacassets[assetid]['file:checksum'] = checksum
+      logging.debug(f"Added multihash checksum for asset {assetid}: {checksum}")
+
   #Update the STAC Item and save it locally to be posted
   dtmp.cleanup()
   #Assets are the uploaded assets
@@ -520,7 +538,7 @@ for pd in args['product']:
       logging.error(f"{pd} ingestion failed. Terminating.")
       break
 
-#Determine the numer of failed items as errorcode
+#Determine the number of failed items as errorcode
 errorcode=0
 for pubp in published_stacs:
   if 'failure_reason' in pubp:
