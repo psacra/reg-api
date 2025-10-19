@@ -19,6 +19,7 @@ parser.add_argument('--item-datetime-regex', type=str, help='Regex to extract da
 parser.add_argument('--item-ID', type=str, help='Override STAC Item ID. Default is the one provided in the product STAC or the product name without extenstion')
 parser.add_argument('--item-ID-regex', type=str, nargs=2, action='append', help='Apply a regular expression to the STAC Item ID before ingesting it. Useful to correct invalid IDs. Regex must be in python sub regex format, pattern and replacement to be separated by a space e.g. [^a-zA-Z0-9_-] _ will replace all invalid ID characheters with undersores. Multiple use of this argument are possible.')
 parser.add_argument('--item-default-asset-type', type=str, default='application/octet-stream', help='STAC asset type used in the STAC Item creation if the input is an asset. Default is: application/octet-stream')
+parser.add_argument('--data-type', type=str, help='Specify the image type for assets. If not set, will be detected from file extension: .tif -> image/tiff; application=geotiff; profile=cloud-optimized, .zarr -> application/x-zarr; profile=cloud-optimized . It is therefore assumed that both GeoTiff and Zarr assets are cloud-optimized and the use should make sure this is the case.')
 
 parser.add_argument('--rapi-endpoint', type=str, default='https://eoresults.esa.int/reg-api/', help='Registration API Endpoint [RAPI_REGAPI_ENDPOINT]. Defaults to: https://eoresults.esa.int/reg-api/')
 parser.add_argument('--rapi-s3-endpoint', type=str, default='http://eoresults.esa.int', help='S3 Stagein Endpoint [RAPI_S3_ENDPOINT]. Default is eoresults.esa.int')
@@ -301,6 +302,14 @@ def compute_multihash_sha256(filepath):
   multihash_bytes = b'\x12' + bytes([len(digest)]) + digest
   return multihash_bytes.hex()
 
+def detect_data_type(filename):
+  ext = filename.lower().split('.')[-1]
+  if ext == 'tif':
+    return "image/tiff; application=geotiff; profile=cloud-optimized"
+  elif ext == 'zarr':
+    return "application/x-zarr; profile=cloud-optimized"
+  return None
+
 def publish_stac(pd):
   #Download the product
   logging.info(f"Publishing product {pd}")
@@ -477,6 +486,15 @@ def publish_stac(pd):
       checksum = compute_multihash_sha256(asset_localpath)
       stacassets[assetid]['file:checksum'] = checksum
       logging.debug(f"Added multihash checksum for asset {assetid}: {checksum}")
+
+    # Set asset type from --data-type or detect from extension if not set
+    if args.get('data_type'):
+      stacassets[assetid]['type'] = args['data_type']
+    elif 'type' not in stacassets[assetid] or not stacassets[assetid]['type']:
+      detected_type = detect_data_type(asset_localpath)
+      if detected_type:
+        stacassets[assetid]['type'] = detected_type
+        logging.debug(f"Detected asset type for {assetid}: {detected_type}")
 
   #Update the STAC Item and save it locally to be posted
   dtmp.cleanup()
