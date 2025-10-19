@@ -225,9 +225,51 @@ def create_stac_item(assetslist):
     else:
       assetid='PRODUCT'
     assetnum+=1
-    stacassets[assetid]={ "href": asset,"title": "Product","type": args['item_default_asset_type'] }
-  stac_item={"type": "Feature","stac_version": "1.0.0","stac_extensions": ["https://stac-extensions.github.io/alternate-assets/v1.1.0/schema.json","https://stac-extensions.github.io/storage/v1.0.0/schema.json"],"id": stacid, "properties": {"datetime": stacdatetime }, "assets": stacassets }
+
+    # Calculate file size
+    try:
+      file_size = os.path.getsize(asset)
+    except Exception:
+      file_size = None
+
+    # Detect type
+    detected_type = detect_data_type(asset)
+    asset_type = detected_type if detected_type else args['item_default_asset_type'] if args['item_default_asset_type'] else ""
+
+    # Prepare asset dict
+    asset_dict = {
+      "href": asset,
+      "title": "Product",
+      "type": asset_type,
+      "role": "data",
+      "file:size": file_size
+    }
+
+    # Add checksum if available
+    checksum = None
+    try:
+      checksum = compute_multihash_sha256(asset)
+    except Exception:
+      checksum = None
+    if checksum:
+      asset_dict["file:checksum"] = checksum
+
+    stacassets[assetid] = asset_dict
+
+  stac_item = {
+    "type": "Feature",
+    "stac_version": "1.0.0",
+    "stac_extensions": [
+      "https://stac-extensions.github.io/alternate-assets/v1.1.0/schema.json",
+      "https://stac-extensions.github.io/storage/v1.0.0/schema.json"
+    ],
+    "id": stacid,
+    "properties": {"datetime": stacdatetime},
+    "assets": stacassets
+  }
+
   return stac_item
+
 def href_realpath(remotepath,localpath):
   #If localpath is already an absolute path, just pass it back
   if localpath[0]=='/' or '://' in localpath:
