@@ -245,15 +245,6 @@ def create_stac_item(assetslist):
       "file:size": file_size
     }
 
-    # Add checksum if available
-    checksum = None
-    try:
-      checksum = compute_multihash_sha256(asset)
-    except Exception:
-      checksum = None
-    if checksum:
-      asset_dict["file:checksum"] = checksum
-
     stacassets[assetid] = asset_dict
 
   stac_item = {
