@@ -1,23 +1,28 @@
 #!/bin/env python3
 
 #Basic imports
-import os, sys, json, argparse, tempfile, shutil, datetime, logging, subprocess
+import os, sys, json, argparse, tempfile, shutil, datetime, logging, subprocess, re, hashlib
 
 #Get commandline input
 parser = argparse.ArgumentParser(prog='Registration API Gateway Client',
                     description='Ingest data into the Registation API Gateway')
 
 parser.add_argument('product', type=str, nargs='+', help='Link to product to be ingested. See mode parameter for type of products supported.')
-parser.add_argument('-M','--mode', type=str, choices=['autodetect','asset','assetmerge','stac'], default='autodetect', help="Define what kind of input products are provided. 'stac' mode will consider each input product to be a valid STAC (Item, Catalogue, Collection or FeatureCollection), an error will be thrown if STAC is not valid. 'asset' mode will consider each input product to be a single STAC Asset to be ingested as a single STAC Item,  'assetmerge' will create one single STAC Item for all the input products assets, 'autodetect' mode is default and will try to load the item as a STAC. If invalid, it will threat it as an asset.")
+parser.add_argument('-M','--mode', type=str, choices=['autodetect','asset','assetmerge','stac'], default='autodetect', help="Define what kind of input products are provided. 'stac' mode will consider each input product to be a valid STAC (Item, Catalogue, Collection or FeatureCollection), an error will be thrown if STAC is not valid. 'asset' mode will consider each input product to be a single STAC Asset to be ingested as a single STAC Item,  'assetmerge' will create one single STAC Item for all the input products assets, 'autodetect' mode is default and will try to load the item as a STAC. If invalid, it will treat it as an asset.")
 parser.add_argument('-c','--rapi-collection-id', type=str, help='Collection ID where products will be ingested. Defaults to the one in the STAC item [RAPI_COLLECTION_ID]')
 parser.add_argument('-u','--rapi-username', type=str, help='Data Provider Username. Can be provided via command line or envionment variable [RAPI_USERNAME]')
 parser.add_argument('-p','--rapi-password', type=str, help='Data Provider Password. Can be provided via command line or envionment variable [RAPI_PASSWORD]')
 parser.add_argument('-b','--rapi-stagein-bucket', type=str,  help='Data Provider S3 Stagein Bucket to use. Defaults to "sg-<username>-generic" [RAPI_STAGEIN_BUCKET]')
 
-parser.add_argument('--item-datetime', type=str, help='Override STAC Item datetime. Default is the one provided in the product STAC or the ingestion date time.')
+parser.add_argument('--item-datetime', type=str, help='Use the provided string as start_time/end_time for the STAC Item. Format is YYYY-MM-DDTHH:MM:SSZ/YYYY-MM-DDTHH:MM:SSZ . If only one datetime is provided, it will be used as both start_datetime and end_datetime. The STAC Item datetime will be set to the start_date.')
+parser.add_argument('--item-date-regex', type=str, help='Extract start_time and end_time metadata from the product filename, following the specified regex. Use named groups: sY, sm, sD, sH, sM, sS for start; eY, em, eD, eH, eM, eS for end. If the end_time is not specified from the regex, it will be set to start_time. If only part of the date, e.g. only the year is extracted, the script will try to infer the closest start and end date. For example, if year 2001 is the only value extracted for the start date, start_date will be set to 2001-01-01T00:00:00. The STAC Item datetime will be set to the start_date. As example, if the file name is "Test_20220315_20230103", the regex "Test_(?P<sY>[0-9]{4})" will generate a start_date of 2022-01-01T00:00:00 while "Test_(?P<sY>[0-9]{4})(?P<sm>[0-9]{2})" will generate a start date of 2022-03-01T00:00:00. Note that you can use the "--dry-run -C" switches to check your regular expression is working properly.')
+
 parser.add_argument('--item-ID', type=str, help='Override STAC Item ID. Default is the one provided in the product STAC or the product name without extenstion')
 parser.add_argument('--item-ID-regex', type=str, nargs=2, action='append', help='Apply a regular expression to the STAC Item ID before ingesting it. Useful to correct invalid IDs. Regex must be in python sub regex format, pattern and replacement to be separated by a space e.g. [^a-zA-Z0-9_-] _ will replace all invalid ID characheters with undersores. Multiple use of this argument are possible.')
-parser.add_argument('--item-default-asset-type', type=str, default='application/octet-stream', help='STAC asset type used in the STAC Item creation if the input is an asset. Default is: application/octet-stream')
+parser.add_argument('--item-default-asset-type', type=str, help='STAC asset type used in the STAC Item if asset is not specified. If not specified, the client will assign the following types according to asset extension: .tif -> image/tiff; application=geotiff; profile=cloud-optimized, .zarr -> application/x-zarr; profile=cloud-optimized , for the others it will try to use the output of the file command or fallback to application/octet-stream. NOTE: It is assumed that both Tiff and Zarr assets are geolocated and cloud-optimized unless this argument specifies otherwise.')
+parser.add_argument('--item-asset-zipping-disable', action='store_true', help='Disable automatic zipping of directories. If not set, the client will zip assets encoded as directories, such as Zarr files, before uploading them')
+parser.add_argument('--item-asset-checksum-disable', action='store_true', help='Disable ingested asset SHA2-256 checksums. If not set, the client will generate a checksum for the assets to be ingested, check it againist the STAC item one if provided or add it to the STAC item if not.')
+parser.add_argument('--assets-rio-stac', action='store_true', help='If in single asset mode, use rio-stac to extract metadata. IMPORTANT: Data needs to be in a format supported by rio-stac (e.g. Cloud Optmized GeoTIFF). NOTE: You need rio-stac to be installed following documentation on https://developmentseed.org/rio-stac/.')
 
 parser.add_argument('--rapi-endpoint', type=str, default='https://eoresults.esa.int/reg-api/', help='Registration API Endpoint [RAPI_REGAPI_ENDPOINT]. Defaults to: https://eoresults.esa.int/reg-api/')
 parser.add_argument('--rapi-s3-endpoint', type=str, default='http://eoresults.esa.int', help='S3 Stagein Endpoint [RAPI_S3_ENDPOINT]. Default is eoresults.esa.int')
@@ -36,6 +41,7 @@ parser.add_argument('--curl-path', type=str, help='Path to the curl software, to
 parser.add_argument('--temporary-path', type=str, default=tempfile.gettempdir(), help='Temporary path for assets. Assets will be downloaded to this path before upload. This path need to be big enough to host the maximum asset size.')
 parser.add_argument('--continue-on-error', action='store_true', help='Continue ingestion even if there is an error on one Item/Asset. Default is to terminate all ingestion.')
 parser.add_argument('-C','--output-stac', action='store_true', help='Display the ingested STAC Items') 
+parser.add_argument('--dry-run', action='store_true', help='Do not upload dataset nor register STAC items. Useful in conjunction with -C to check proper STAC Items are generated')
 parser.add_argument('--verbose', '-v', action='count', default=0, help='Increase output verbosity. Default is INFO')
 parser.add_argument('--silent', '-s', action='count', default=0, help='Decrease output verbosity. Default is INFO')
 
@@ -181,7 +187,7 @@ def product_download(src):
     logging.error(f'Input product {dst} do not exists or is not accessible!')
     return None
   #Check if what you downloaded is a folder, if so, package it
-  if os.path.isdir(dst) or dst.endswith('/'):
+  if not args['item_asset_zipping_disable'] and ( os.path.isdir(dst) or dst.endswith('/') ):
     logging.info(f'STAC Asset is a directory. Packaging it as a ZIP file...')
     dst_old=dst
     if dst.endswith('/'): dst[:-1]
@@ -191,8 +197,15 @@ def product_download(src):
     logging.debug(f"Old {dst} deleted.")
     dst+='.zip'
   #Give always the absolute path back
-  return os.path.realpath(dst)
+  return os.path.abspath(dst)
 def asset_upload(src,dst):
+  if args.get('dry_run'):
+    logging.info("Dry-run mode enabled. Skipping asset upload")
+    return dst
+  #If we need to upload a directory, src and destination shall end with /
+  if os.path.isdir(src):
+    if src[-1]!='/': src+='/'
+    if dst[-1]!='/': dst+='/'
   #Upload using S3
   command=[args['s5cmd_path'],'--endpoint-url',args['rapi_s3_endpoint'],'cp']
   if args['loglevel']>=0:
@@ -206,12 +219,79 @@ def asset_upload(src,dst):
     logging.error(f"Error in subcommand execution. {e}. See above")
     return None
   return dst
+def ingest_stac(stac_item,collection):
+  if args.get('dry_run'):
+    logging.info("Dry-run mode enabled. Skipping post of STAC Item")
+    return stac_item
+
+  #Pubblication endpoint
+  rapi_ingestion_endpoint=f"{args['rapi_endpoint']}{collection}/items"
+
+  #Save the STAC item to be ingested
+  stac_item_path=os.path.join(dtmp.name,'tbp.json')
+  with open(stac_item_path,'w') as f:
+    json.dump(stac_item,f)
+
+  command=[args['curl_path'],'-X','POST','-T',stac_item_path,'-H','Content-Type: application/json','-u',f"{args['rapi_username']}:{args['rapi_password']}",rapi_ingestion_endpoint]
+  if args['loglevel'] < 0:
+    command+=['-s','-S']
+  elif args['loglevel'] == 0:
+    command.append('-#')
+  elif args['loglevel'] > 1:
+    command.append('-v')
+  logging.debug(f'Running {command} with stac "{json.dumps(stac_item)}"')
+  try:
+    res=subprocess.run(command,cwd=dtmp.name,check=True,stdout=subprocess.PIPE)
+  except Exception as e:
+    logging.error(f"Error in subcommand execution. {e}. See above")
+    return [{"id": stac_item['id'], "failure_reason": f"Error in reg-api call."}]
+
+  #Try to read the output message (which should be a JSON)
+  try:
+    ingested_stac_item=json.loads(res.stdout.decode('utf-8'))
+  except Exception as e:
+    logging.error(f"Error in reg-api call. Output is not a JSON")
+    return [{"id": stac_item['id'], "failure_reason": f"Error in reg-api call. Output is not a JSON"}]
+
+  #If this is an invalid output (does not contain ID nor failure reason, then it is a failure)
+  if 'id' not in ingested_stac_item:
+    logging.error(f"Error in reg-api call. Output is not what is expected (no ID included). Returned output is {ingested_stac_item}")
+    return {"id": stac_item['id'], "failure_reason": f"Error in reg-api call. Output is not what is expected (no ID included). Returned output is {ingested_stac_item}"}
+
+  return ingested_stac_item
+
 def product_filename(src):
   #Very basic filename extraction, to be extended
   return os.path.basename(src)
 def create_stac_item(assetslist):
+  if len(assetslist)==1 and args.get('assets_rio_stac') and os.path.exists(assetslist[0]):
+    #If a single product, local and rio-stac enabled, try to call rio-stac on the asset to get the product
+    logging.debug(f"Using rio-stac to generate item base metadata...")
+    command=['rio','stac',assetslist[0]]
+    try:
+      #Run rio-stac
+      stac_item_str=subprocess.check_output(command).decode('utf-8')
+      #Load the resulting json
+      stac_item=json.loads(stac_item_str)
+      #Check the resulting json is a STAC item and has a proper asset
+      if 'id' not in stac_item:
+        raise Exception("Invalid STAC Item generated by rio-stac. Id metadata not present")
+      elif 'assets' not in stac_item:
+        raise Exception("Invalid STAC Item generated by rio-stac. Assets not present")
+      elif len(stac_item['assets'])!=1:
+        raise Exception("Invalid STAC Item generated by rio-stac. Assets invalid")
+      #Override assets to add data "roles" as required
+      for p in stac_item['assets']:
+        if 'data' not in stac_item['assets'][p]['roles']:
+          stac_item['assets'][p]['roles'].append('data')
+    except Exception as e:
+      logging.error(f"Failed to run rio-stac for item {assetslist[0]}. Error is: {e}. Falling back to bare STAC")
+    else:
+      return stac_item
+
+  #Standard basic STAC metadata
   #Default STAC IDs and datetimes. Will be overwritten later if specified by commandline
-  stacdatetime=datetime.datetime.now(datetime.timezone.utc).strftime('%Y%m%dT%H%M%SZ')
+  stacdatetime=datetime.datetime.now(datetime.timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')
   stacid=product_filename(assetslist[0])
   stacid=stacid.rsplit('.',1)[0]
   stacassets={}
@@ -222,9 +302,29 @@ def create_stac_item(assetslist):
     else:
       assetid='PRODUCT'
     assetnum+=1
-    stacassets[assetid]={ "href": asset,"title": "Product","type": args['item_default_asset_type'] }
-  stac_item={"type": "Feature","stac_version": "1.0.0","stac_extensions": ["https://stac-extensions.github.io/alternate-assets/v1.1.0/schema.json","https://stac-extensions.github.io/storage/v1.0.0/schema.json"],"id": stacid, "properties": {"datetime": stacdatetime }, "assets": stacassets }
+
+    # Prepare asset dict
+    asset_dict = {
+      "href": asset,
+      "title": "Product",
+      "roles": ["data"]
+    }
+
+    stacassets[assetid] = asset_dict
+
+  stac_item = {
+    "type": "Feature",
+    "stac_version": "1.0.0",
+    "stac_extensions": [
+      "https://stac-extensions.github.io/file/v2.1.0/schema.json"
+    ],
+    "id": stacid,
+    "properties": {"datetime": stacdatetime},
+    "assets": stacassets
+  }
+
   return stac_item
+
 def href_realpath(remotepath,localpath):
   #If localpath is already an absolute path, just pass it back
   if localpath[0]=='/' or '://' in localpath:
@@ -232,6 +332,85 @@ def href_realpath(remotepath,localpath):
   #Use a relative path (but remove the scheme, if any)
   return os.path.abspath('/'+remotepath+'/'+localpath).replace(':/','://',1)[1:]
   
+def parse_item_datetime(dt_str):
+  # Accepts 'start/end' or single datetime
+  if dt_str is None:
+    return None, None
+  if '/' in dt_str:
+    start, end = dt_str.split('/', 1)
+    return start, end
+  return dt_str, dt_str
+
+def extract_datetime_from_filename(product, regex):
+  dts = re.compile(regex).search(product)
+  if not dts:
+    logging.error("Datetime regex did not match product filename.")
+    return None, None
+  dts = dts.groupdict()
+  # Start date
+  try:
+    if 'sY' not in dts:
+      logging.error("Regex must provide at least 'sY' (start year).")
+      return None, None
+    sY = int(dts['sY'])
+    sm = int(dts.get('sm', 1))
+    sD = int(dts.get('sD', 1))
+    sH = int(dts.get('sH', 0))
+    sM = int(dts.get('sM', 0))
+    sS = int(dts.get('sS', 0))
+    startDate = datetime.datetime(sY, sm, sD, sH, sM, sS)
+  except Exception as e:
+    logging.error(f"Error parsing start datetime: {e}")
+    return None, None
+  # End date
+  try:
+    if 'eY' not in dts:
+      endDate = startDate
+    else:
+      eY = int(dts['eY'])
+      em = int(dts.get('em', 12))
+      # Days in month
+      if 'eD' not in dts:
+        if em == 2:
+          eD = 28
+        elif em in [11, 4, 7, 9]:
+          eD = 30
+        else:
+          eD = 31
+      else:
+        eD = int(dts['eD'])
+      eH = int(dts.get('eH', 23))
+      eM = int(dts.get('eM', 59))
+      eS = int(dts.get('eS', 59))
+      endDate = datetime.datetime(eY, em, eD, eH, eM, eS)
+  except Exception as e:
+    logging.error(f"Error parsing end datetime: {e}")
+    endDate = startDate
+  return startDate.strftime('%Y-%m-%dT%H:%M:%SZ'), endDate.strftime('%Y-%m-%dT%H:%M:%SZ')
+
+def compute_multihash_sha256(filepath):
+  # Multihash format: <hash code><digest length><digest>
+  # SHA2-256 code: 0x12, digest length: 32 bytes
+  hash_func = hashlib.sha256()
+  with open(filepath, 'rb') as f:
+    for chunk in iter(lambda: f.read(8192), b''):
+      hash_func.update(chunk)
+  digest = hash_func.digest()
+  multihash_bytes = b'\x12' + bytes([len(digest)]) + digest
+  return multihash_bytes.hex()
+
+def detect_data_type(filename):
+  ext = filename.lower().split('.')[-1]
+  if ext == 'tif':
+    return "image/tiff; application=geotiff; profile=cloud-optimized"
+  elif ext == 'zarr':
+    return "application/x-zarr; profile=cloud-optimized"
+  else:
+    try:
+      return subprocess.check_output(['file','-b','--mime-type',path],stderr=subprocess.STDOUT).decode('utf-8').strip()
+    except Exception:
+      return "application/octet-stream"
+
 def publish_stac(pd):
   #Download the product
   logging.info(f"Publishing product {pd}")
@@ -263,17 +442,17 @@ def publish_stac(pd):
     #Check the STAC is valid
     #type is mandatory
     if 'type' not in stac_item:
-      logging.error(f'{pd} is a JSON but an invlid STAC (no type metadata present). Cannot ingest it! Force the mode to be "asset" if you want to ingest it as a binary')
+      logging.error(f'{pd} is a JSON but an invalid STAC (no type metadata present). Cannot ingest it! Force the mode to be "asset" if you want to ingest it as a binary')
       return [{"id": "UNKNOWN", "failure_reason": f'{pd} is invalid. No type metadata present.'}]
     stac_item_type=stac_item['type'].lower()
     logging.debug(f"STAC is of type {stac_item_type}")
     #stac_version is mandatory except than for FeatureCollection items
     if 'stac_version' not in stac_item and stac_item_type!='featurecollection':
-      logging.error(f'{pd} is a JSON but an invlid STAC (no stac_version metadata present). Cannot ingest it! Force the mode to be "asset" if you want to ingest it as a binary')
+      logging.error(f'{pd} is a JSON but an invalid STAC (no stac_version metadata present). Cannot ingest it! Force the mode to be "asset" if you want to ingest it as a binary')
       return [{"id": "UNKNOWN", "failure_reason": f'{pd} is invalid. No stac_version metadata present.'}]
     #id is mandatory except for FeatureCollection items
     if 'id' not in stac_item and stac_item_type!='featurecollection':
-      logging.error(f'{pd} is a JOSN but an invlid STAC (no id metadata present). Cannot ingest it! Force the mode to be "asset" if you want to ingest it as a binary')
+      logging.error(f'{pd} is a JOSN but an invalid STAC (no id metadata present). Cannot ingest it! Force the mode to be "asset" if you want to ingest it as a binary')
       return [{"id": "UNKNOWN", "failure_reason": f'{pd} is invalid. No id metadata present.'}]
     #According to the type of the STAC, we parse it
     if stac_item_type=='catalog' or stac_item_type=='collection':
@@ -352,13 +531,37 @@ def publish_stac(pd):
   elif 'collection' not in stac_item:
     logging.error(f"STAC {pd} has no 'collection' metadata defined in the STAC item. Specify one via the --collection-id parameter!")
     return  [{"id": stac_item['id'], "failure_reason": f'No collection specified'}]
-  #Override the STAC items parameters if requestd
+  # Override datetime from filename regex if requested
+  if 'properties' not in stac_item:
+    stac_item_prop = {}
+  else:
+    stac_item_prop=stac_item['properties']
+  if args.get('item_date_regex'):
+    start_dt, end_dt = extract_datetime_from_filename(product_filename(pd), args['item_date_regex'])
+    if start_dt and end_dt:
+      stac_item_prop['start_datetime'] = start_dt
+      stac_item_prop['end_datetime'] = end_dt
+      stac_item_prop['datetime']=start_dt
+      logging.debug(f"Set start_datetime to {start_dt}, end_datetime to {end_dt} and datetime to {start_dt} from filename regex")
+  #Override the STAC items parameters if requested
   if args['item_datetime'] is not None:
-    if 'datetime' in stac_item:
-      logging.debug(f"Replacing datetime from {stac_item['datetime']} to {args['item_datetime']}")
-    else:
-      logging.debug(f"Setting datetime to {args['item_datetime']}")
-    stac_item['datetime']=args['item_datetime']
+    start_dt, end_dt = parse_item_datetime(args['item_datetime'])
+    if start_dt and end_dt:
+      stac_item_prop['start_datetime'] = start_dt
+      stac_item_prop['end_datetime'] = end_dt
+      stac_item_prop['datetime']=start_dt
+      logging.debug(f"Set start_datetime to {start_dt}, end_datetime to {end_dt} and datetime to {start_dt} from input string")
+  #Enforce start and end datetime, following profile
+  if 'datetime' not in stac_item_prop and 'start_datetime' not in stac_item_prop:
+    logging.error(f"STAC {pd} has no 'datetime' nor 'start_datetime' metadata defined in the STAC item. Specify one via the --item-date-regex or --item-datetime parameters!")
+    return  [{"id": stac_item['id'], "failure_reason": f'No collection specified'}]
+  if 'datetime' in stac_item_prop and 'start_datetime' not in stac_item_prop:
+    stac_item_prop['start_datetime'] = stac_item_prop['datetime']
+    logging.debug(f"Set start_datetime to {stac_item_prop['start_datetime']}.")
+  if 'end_datetime' not in stac_item_prop:
+    stac_item_prop['end_datetime'] = stac_item_prop['start_datetime']
+    logging.debug(f"Set end_datetime to {stac_item_prop['start_datetime']}") 
+  #Execute changes in the item ID, if requested
   if args['item_ID'] is not None:
     logging.debug(f"Replacing id from {stac_item['id']} to {args['item_ID']}")
     stac_item['id']=args['item_ID']
@@ -368,18 +571,64 @@ def publish_stac(pd):
       logging.debug(f"Applying regular expression {r[0]} -> {r[1]} to ID")
       stac_item['id']=re.sub(r[0],r[1],stac_item['id'])
     logging.debug(f"New ID is {stac_item['id']}")
-  #Upload all the assets
+  #Require file stac extension for assets
+  if 'stac_extensions' not in stac_item:
+    stac_item['stac_extensions']=['https://stac-extensions.github.io/file/v2.1.0/schema.json']
+  elif 'https://stac-extensions.github.io/file/v2.1.0/schema.json' not in stac_item['stac_extensions']:
+    stac_item['stac_extensions']+=['https://stac-extensions.github.io/file/v2.1.0/schema.json']
+  
+  #Start work on the assets
   logging.debug("Uploding STAC Item assets...")
   if 'assets' not in stac_item:
     logging.error(f"STAC Item {pd} does not contain assets. Cannot be ingested!")
     return  [{"id": stac_item['id'], "failure_reason": f"STAC Item {pd} does not contain assets."}]
   stacassets=stac_item['assets']
+  #Check there is at least one asset with role data (this is a requirement from the client)
+  one_role_is_present=False
   for assetid in stacassets:
+    if 'roles' in stacassets[assetid] and 'data' in stacassets[assetid]['roles']:
+      one_role_is_present=True
+      break
+  if not one_role_is_present:
+    logging.error(f"STAC Item {pd} ingestion failed. Item should contain at least one asset with 'data' role!")
+    return  [{"id": stac_item['id'], "failure_reason": f"Item should contain at least one asset with 'data' role!"}]
+  #Parse the assets
+  for assetid in stacassets:
+    #Download the asset
     logging.debug(f"Downloading asset {assetid}...")
     asset_localpath=product_download(href_realpath(product_remotepath,stacassets[assetid]['href']))
     if asset_localpath is None:
       logging.error(f"STAC Item {pd} ingestion failed. Asset {assetid} cannot be downloaded!")
       return  [{"id": stac_item['id'], "failure_reason": f"Asset {assetid} download failed!"}]
+    
+    #Check asset size and checksum
+    asset_localsize=os.path.getsize(asset_localpath)
+    if 'file:size' in stacassets[assetid]:
+      if stacassets[assetid]['file:size'] != asset_localsize:
+        logging.error(f"STAC Item {pd} ingestion failed. Downloaded asset {assetid} file size does not match STAC metadata!")
+        return  [{"id": stac_item['id'], "failure_reason": f"Asset {assetid} download failed! File size does not match STAC metadata"}]
+    else:
+      stacassets[assetid]['file:size']=asset_localsize
+    if not args.get('item_asset_checksum_disable') and not os.path.isdir(asset_localpath):
+      logging.debug(f"Calculating checksum for asset {assetid}...")
+      asset_checksum = compute_multihash_sha256(asset_localpath)
+      if 'file:checksum' in stacassets[assetid]:
+        if stacassets[assetid]['file:checksum'] != asset_checksum:
+          logging.error(f"STAC Item {pd} ingestion failed. Downloaded asset {assetid} checksum does not match STAC metadata!")
+          return  [{"id": stac_item['id'], "failure_reason": f"Asset {assetid} download failed! File checksum does not match STAC metadata"}]
+      else:
+        stacassets[assetid]['file:checksum']=asset_checksum
+        logging.debug(f"Added multihash checksum for asset {assetid}: {asset_checksum}")
+    
+    #Add asset type (if not present)
+    if 'type' not in stacassets[assetid]:
+      if args['item_default_asset_type']:
+        stacassets[assetid]['type']=args['item_default_asset_type']
+      else:
+        stacassets[assetid]['type'] = detect_data_type(asset_localpath)
+      logging.debug(f"Added type for asset {assetid}: {stacassets[assetid]['type']}")
+
+    # Upload the asset
     asset_remotepath=os.path.basename(asset_localpath)
     logging.debug(f"Uploading asset {assetid}...")
     if asset_upload(asset_localpath,asset_remotepath) is None:
@@ -391,42 +640,14 @@ def publish_stac(pd):
   dtmp.cleanup()
   #Assets are the uploaded assets
   stac_item['assets']=stacassets
-  #Links are to be removed (will be recreated by the catalogue)
+  #Remove the links (will be added again by the catalogue)
   if 'links' in stac_item: del stac_item['links']
   #Remove also the collection (will be added again by the catalogue)
-  rapi_ingestion_endpoint=f"{args['rapi_endpoint']}{stac_item['collection']}/items"
+  collection=stac_item['collection']
   del stac_item['collection']
-  #Save the STAC item to be ingested
-  stac_item_path=os.path.join(dtmp.name,'tbp.json')
-  with open(stac_item_path,'w') as f:
-    json.dump(stac_item,f)
+
   #Ingest the STAC item
-  command=[args['curl_path'],'-X','POST','-T',stac_item_path,'-H','Content-Type: application/json','-u',f"{args['rapi_username']}:{args['rapi_password']}",rapi_ingestion_endpoint]
-  if args['loglevel'] < 0:
-    command+=['-s','-S']
-  elif args['loglevel'] == 0:
-    command.append('-#')
-  elif args['loglevel'] > 1:
-    command.append('-v')
-  logging.debug(f'Running {command} with stac "{json.dumps(stac_item)}"')
-  try:
-    res=subprocess.run(command,cwd=dtmp.name,check=True,stdout=subprocess.PIPE)
-  except Exception as e:
-    logging.error(f"Error in subcommand execution. {e}. See above")
-    return [{"id": stac_item['id'], "failure_reason": f"Error in reg-api call."}]
-
-  #Try to read the output message (which should be a JSON)
-  try:
-    ingested_stac_item=json.loads(res.stdout.decode('utf-8'))
-  except Exception as e:
-    logging.error(f"Error in reg-api call. Output is not a JSON")
-    return [{"id": stac_item['id'], "failure_reason": f"Error in reg-api call. Output is not a JSON"}]
-
-  #If this is an invalid output (does not contain ID nor failure reason, then it is a failure)
-  if 'id' not in ingested_stac_item:
-    logging.error(f"Error in reg-api call. Output is not what is expected (no ID included). Returned output is {ingested_stac_item}")
-    return [{"id": stac_item['id'], "failure_reason": f"Error in reg-api call. Output is not what is expected (no ID included). Returned output is {ingested_stac_item}"}]
-
+  ingested_stac_item=ingest_stac(stac_item,collection)
   return [ingested_stac_item]
 
 if args['mode']=='assetmerge':
@@ -447,7 +668,7 @@ for pd in args['product']:
       logging.error(f"{pd} ingestion failed. Terminating.")
       break
 
-#Determine the numer of failed items as errorcode
+#Determine the number of failed items as errorcode
 errorcode=0
 for pubp in published_stacs:
   if 'failure_reason' in pubp:
