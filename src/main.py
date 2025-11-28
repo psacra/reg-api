@@ -459,7 +459,7 @@ async def add_item_to_collection(assets_source: str, assets_dest: str, stac_dest
 
 @app.delete(
   "/collections/{collectionId}/items/{recordId}",
-  tags=["Implemented transaction operations:"],
+  tags=["Implemented tranaction operations:"],
   summary="Delete an Item or an ItemCollection from a collection",
   description="""This call allows to **delete** a STAC Item or ItemCollection from the catalogue and datastore.
 
@@ -578,4 +578,3 @@ async def collection_items_del_request(
     return JSONResponse(status_code=201,content={"id":recordId,"message":"deleted"})
   else:
     raise HTTPException(status_code=422, detail=failure_reason)
-
