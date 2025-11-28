@@ -459,7 +459,7 @@ async def add_item_to_collection(assets_source: str, assets_dest: str, stac_dest
 
 @app.delete(
   "/collections/{collectionId}/items/{recordId}",
-  tags=["Implemented tranaction operations:"],
+  tags=["Implemented transaction operations:"],
   summary="Delete an Item or an ItemCollection from a collection",
   description="""This call allows to **delete** a STAC Item or ItemCollection from the catalogue and datastore.
 
