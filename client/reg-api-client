@@ -38,6 +38,7 @@ parser.add_argument('--curl-path', type=str, help='Path to the curl software, to
 parser.add_argument('--temporary-path', type=str, default=tempfile.gettempdir(), help='Temporary path for assets. Assets will be downloaded to this path before upload. This path need to be big enough to host the maximum asset size.')
 parser.add_argument('--continue-on-error', action='store_true', help='Continue ingestion even if there is an error on one Item/Asset. Default is to terminate all ingestion.')
 parser.add_argument('-C','--output-stac', action='store_true', help='Display the ingested STAC Items') 
+parser.add_argument('--dry-run', action='store_true', help='Do not upload dataset nor register STAC items. Useful in conjunction with -C to check proper STAC Items are generated')
 parser.add_argument('--verbose', '-v', action='count', default=0, help='Increase output verbosity. Default is INFO')
 parser.add_argument('--silent', '-s', action='count', default=0, help='Decrease output verbosity. Default is INFO')
 parser.add_argument('--add-checksum', action='store_true', help='Add a multihash checksum for each asset using SHA2-256 and standard hashlib.')
@@ -184,7 +185,7 @@ def product_download(src):
     logging.error(f'Input product {dst} do not exists or is not accessible!')
     return None
   #Check if what you downloaded is a folder, if so, package it
-  if os.path.isdir(dst) or dst.endswith('/'):
+  if not args['item_asset_zipping_disable'] and ( os.path.isdir(dst) or dst.endswith('/') ):
     logging.info(f'STAC Asset is a directory. Packaging it as a ZIP file...')
     dst_old=dst
     if dst.endswith('/'): dst[:-1]
@@ -194,8 +195,15 @@ def product_download(src):
     logging.debug(f"Old {dst} deleted.")
     dst+='.zip'
   #Give always the absolute path back
-  return os.path.realpath(dst)
+  return os.path.abspath(dst)
 def asset_upload(src,dst):
+  if args.get('dry_run'):
+    logging.info("Dry-run mode enabled. Skipping asset upload")
+    return dst
+  #If we need to upload a directory, src and destination shall end with /
+  if os.path.isdir(src):
+    if src[-1]!='/': src+='/'
+    if dst[-1]!='/': dst+='/'
   #Upload using S3
   command=[args['s5cmd_path'],'--endpoint-url',args['rapi_s3_endpoint'],'cp']
   if args['loglevel']>=0:
@@ -209,12 +217,79 @@ def asset_upload(src,dst):
     logging.error(f"Error in subcommand execution. {e}. See above")
     return None
   return dst
+def ingest_stac(stac_item,collection):
+  if args.get('dry_run'):
+    logging.info("Dry-run mode enabled. Skipping post of STAC Item")
+    return stac_item
+
+  #Pubblication endpoint
+  rapi_ingestion_endpoint=f"{args['rapi_endpoint']}{collection}/items"
+
+  #Save the STAC item to be ingested
+  stac_item_path=os.path.join(dtmp.name,'tbp.json')
+  with open(stac_item_path,'w') as f:
+    json.dump(stac_item,f)
+
+  command=[args['curl_path'],'-X','POST','-T',stac_item_path,'-H','Content-Type: application/json','-u',f"{args['rapi_username']}:{args['rapi_password']}",rapi_ingestion_endpoint]
+  if args['loglevel'] < 0:
+    command+=['-s','-S']
+  elif args['loglevel'] == 0:
+    command.append('-#')
+  elif args['loglevel'] > 1:
+    command.append('-v')
+  logging.debug(f'Running {command} with stac "{json.dumps(stac_item)}"')
+  try:
+    res=subprocess.run(command,cwd=dtmp.name,check=True,stdout=subprocess.PIPE)
+  except Exception as e:
+    logging.error(f"Error in subcommand execution. {e}. See above")
+    return [{"id": stac_item['id'], "failure_reason": f"Error in reg-api call."}]
+
+  #Try to read the output message (which should be a JSON)
+  try:
+    ingested_stac_item=json.loads(res.stdout.decode('utf-8'))
+  except Exception as e:
+    logging.error(f"Error in reg-api call. Output is not a JSON")
+    return [{"id": stac_item['id'], "failure_reason": f"Error in reg-api call. Output is not a JSON"}]
+
+  #If this is an invalid output (does not contain ID nor failure reason, then it is a failure)
+  if 'id' not in ingested_stac_item:
+    logging.error(f"Error in reg-api call. Output is not what is expected (no ID included). Returned output is {ingested_stac_item}")
+    return {"id": stac_item['id'], "failure_reason": f"Error in reg-api call. Output is not what is expected (no ID included). Returned output is {ingested_stac_item}"}
+
+  return ingested_stac_item
+
 def product_filename(src):
   #Very basic filename extraction, to be extended
   return os.path.basename(src)
 def create_stac_item(assetslist):
+  if len(assetslist)==1 and args.get('assets_rio_stac') and os.path.exists(assetslist[0]):
+    #If a single product, local and rio-stac enabled, try to call rio-stac on the asset to get the product
+    logging.debug(f"Using rio-stac to generate item base metadata...")
+    command=['rio','stac',assetslist[0]]
+    try:
+      #Run rio-stac
+      stac_item_str=subprocess.check_output(command).decode('utf-8')
+      #Load the resulting json
+      stac_item=json.loads(stac_item_str)
+      #Check the resulting json is a STAC item and has a proper asset
+      if 'id' not in stac_item:
+        raise Exception("Invalid STAC Item generated by rio-stac. Id metadata not present")
+      elif 'assets' not in stac_item:
+        raise Exception("Invalid STAC Item generated by rio-stac. Assets not present")
+      elif len(stac_item['assets'])!=1:
+        raise Exception("Invalid STAC Item generated by rio-stac. Assets invalid")
+      #Override assets to add data "roles" as required
+      for p in stac_item['assets']:
+        if 'data' not in stac_item['assets'][p]['roles']:
+          stac_item['assets'][p]['roles'].append('data')
+    except Exception as e:
+      logging.error(f"Failed to run rio-stac for item {assetslist[0]}. Error is: {e}. Falling back to bare STAC")
+    else:
+      return stac_item
+
+  #Standard basic STAC metadata
   #Default STAC IDs and datetimes. Will be overwritten later if specified by commandline
-  stacdatetime=datetime.datetime.now(datetime.timezone.utc).strftime('%Y%m%dT%H%M%SZ')
+  stacdatetime=datetime.datetime.now(datetime.timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')
   stacid=product_filename(assetslist[0])
   stacid=stacid.rsplit('.',1)[0]
   stacassets={}
@@ -374,17 +449,17 @@ def publish_stac(pd):
     #Check the STAC is valid
     #type is mandatory
     if 'type' not in stac_item:
-      logging.error(f'{pd} is a JSON but an invlid STAC (no type metadata present). Cannot ingest it! Force the mode to be "asset" if you want to ingest it as a binary')
+      logging.error(f'{pd} is a JSON but an invalid STAC (no type metadata present). Cannot ingest it! Force the mode to be "asset" if you want to ingest it as a binary')
       return [{"id": "UNKNOWN", "failure_reason": f'{pd} is invalid. No type metadata present.'}]
     stac_item_type=stac_item['type'].lower()
     logging.debug(f"STAC is of type {stac_item_type}")
     #stac_version is mandatory except than for FeatureCollection items
     if 'stac_version' not in stac_item and stac_item_type!='featurecollection':
-      logging.error(f'{pd} is a JSON but an invlid STAC (no stac_version metadata present). Cannot ingest it! Force the mode to be "asset" if you want to ingest it as a binary')
+      logging.error(f'{pd} is a JSON but an invalid STAC (no stac_version metadata present). Cannot ingest it! Force the mode to be "asset" if you want to ingest it as a binary')
       return [{"id": "UNKNOWN", "failure_reason": f'{pd} is invalid. No stac_version metadata present.'}]
     #id is mandatory except for FeatureCollection items
     if 'id' not in stac_item and stac_item_type!='featurecollection':
-      logging.error(f'{pd} is a JOSN but an invlid STAC (no id metadata present). Cannot ingest it! Force the mode to be "asset" if you want to ingest it as a binary')
+      logging.error(f'{pd} is a JOSN but an invalid STAC (no id metadata present). Cannot ingest it! Force the mode to be "asset" if you want to ingest it as a binary')
       return [{"id": "UNKNOWN", "failure_reason": f'{pd} is invalid. No id metadata present.'}]
     #According to the type of the STAC, we parse it
     if stac_item_type=='catalog' or stac_item_type=='collection':
@@ -495,18 +570,64 @@ def publish_stac(pd):
       logging.debug(f"Applying regular expression {r[0]} -> {r[1]} to ID")
       stac_item['id']=re.sub(r[0],r[1],stac_item['id'])
     logging.debug(f"New ID is {stac_item['id']}")
-  #Upload all the assets
+  #Require file stac extension for assets
+  if 'stac_extensions' not in stac_item:
+    stac_item['stac_extensions']=['https://stac-extensions.github.io/file/v2.1.0/schema.json']
+  elif 'https://stac-extensions.github.io/file/v2.1.0/schema.json' not in stac_item['stac_extensions']:
+    stac_item['stac_extensions']+=['https://stac-extensions.github.io/file/v2.1.0/schema.json']
+  
+  #Start work on the assets
   logging.debug("Uploding STAC Item assets...")
   if 'assets' not in stac_item:
     logging.error(f"STAC Item {pd} does not contain assets. Cannot be ingested!")
     return  [{"id": stac_item['id'], "failure_reason": f"STAC Item {pd} does not contain assets."}]
   stacassets=stac_item['assets']
+  #Check there is at least one asset with role data (this is a requirement from the client)
+  one_role_is_present=False
   for assetid in stacassets:
+    if 'roles' in stacassets[assetid] and 'data' in stacassets[assetid]['roles']:
+      one_role_is_present=True
+      break
+  if not one_role_is_present:
+    logging.error(f"STAC Item {pd} ingestion failed. Item should contain at least one asset with 'data' role!")
+    return  [{"id": stac_item['id'], "failure_reason": f"Item should contain at least one asset with 'data' role!"}]
+  #Parse the assets
+  for assetid in stacassets:
+    #Download the asset
     logging.debug(f"Downloading asset {assetid}...")
     asset_localpath=product_download(href_realpath(product_remotepath,stacassets[assetid]['href']))
     if asset_localpath is None:
       logging.error(f"STAC Item {pd} ingestion failed. Asset {assetid} cannot be downloaded!")
       return  [{"id": stac_item['id'], "failure_reason": f"Asset {assetid} download failed!"}]
+    
+    #Check asset size and checksum
+    asset_localsize=os.path.getsize(asset_localpath)
+    if 'file:size' in stacassets[assetid]:
+      if stacassets[assetid]['file:size'] != asset_localsize:
+        logging.error(f"STAC Item {pd} ingestion failed. Downloaded asset {assetid} file size does not match STAC metadata!")
+        return  [{"id": stac_item['id'], "failure_reason": f"Asset {assetid} download failed! File size does not match STAC metadata"}]
+    else:
+      stacassets[assetid]['file:size']=asset_localsize
+    if not args.get('item_asset_checksum_disable') and not os.path.isdir(asset_localpath):
+      logging.debug(f"Calculating checksum for asset {assetid}...")
+      asset_checksum = compute_multihash_sha256(asset_localpath)
+      if 'file:checksum' in stacassets[assetid]:
+        if stacassets[assetid]['file:checksum'] != asset_checksum:
+          logging.error(f"STAC Item {pd} ingestion failed. Downloaded asset {assetid} checksum does not match STAC metadata!")
+          return  [{"id": stac_item['id'], "failure_reason": f"Asset {assetid} download failed! File checksum does not match STAC metadata"}]
+      else:
+        stacassets[assetid]['file:checksum']=asset_checksum
+        logging.debug(f"Added multihash checksum for asset {assetid}: {asset_checksum}")
+    
+    #Add asset type (if not present)
+    if 'type' not in stacassets[assetid]:
+      if args['item_default_asset_type']:
+        stacassets[assetid]['type']=args['item_default_asset_type']
+      else:
+        stacassets[assetid]['type'] = detect_data_type(asset_localpath)
+      logging.debug(f"Added type for asset {assetid}: {stacassets[assetid]['type']}")
+
+    # Upload the asset
     asset_remotepath=os.path.basename(asset_localpath)
     logging.debug(f"Uploading asset {assetid}...")
     if asset_upload(asset_localpath,asset_remotepath) is None:
@@ -533,42 +654,14 @@ def publish_stac(pd):
   dtmp.cleanup()
   #Assets are the uploaded assets
   stac_item['assets']=stacassets
-  #Links are to be removed (will be recreated by the catalogue)
+  #Remove the links (will be added again by the catalogue)
   if 'links' in stac_item: del stac_item['links']
   #Remove also the collection (will be added again by the catalogue)
-  rapi_ingestion_endpoint=f"{args['rapi_endpoint']}{stac_item['collection']}/items"
+  collection=stac_item['collection']
   del stac_item['collection']
-  #Save the STAC item to be ingested
-  stac_item_path=os.path.join(dtmp.name,'tbp.json')
-  with open(stac_item_path,'w') as f:
-    json.dump(stac_item,f)
+
   #Ingest the STAC item
-  command=[args['curl_path'],'-X','POST','-T',stac_item_path,'-H','Content-Type: application/json','-u',f"{args['rapi_username']}:{args['rapi_password']}",rapi_ingestion_endpoint]
-  if args['loglevel'] < 0:
-    command+=['-s','-S']
-  elif args['loglevel'] == 0:
-    command.append('-#')
-  elif args['loglevel'] > 1:
-    command.append('-v')
-  logging.debug(f'Running {command} with stac "{json.dumps(stac_item)}"')
-  try:
-    res=subprocess.run(command,cwd=dtmp.name,check=True,stdout=subprocess.PIPE)
-  except Exception as e:
-    logging.error(f"Error in subcommand execution. {e}. See above")
-    return [{"id": stac_item['id'], "failure_reason": f"Error in reg-api call."}]
-
-  #Try to read the output message (which should be a JSON)
-  try:
-    ingested_stac_item=json.loads(res.stdout.decode('utf-8'))
-  except Exception as e:
-    logging.error(f"Error in reg-api call. Output is not a JSON")
-    return [{"id": stac_item['id'], "failure_reason": f"Error in reg-api call. Output is not a JSON"}]
-
-  #If this is an invalid output (does not contain ID nor failure reason, then it is a failure)
-  if 'id' not in ingested_stac_item:
-    logging.error(f"Error in reg-api call. Output is not what is expected (no ID included). Returned output is {ingested_stac_item}")
-    return [{"id": stac_item['id'], "failure_reason": f"Error in reg-api call. Output is not what is expected (no ID included). Returned output is {ingested_stac_item}"}]
-
+  ingested_stac_item=ingest_stac(stac_item,collection)
   return [ingested_stac_item]
 
 if args['mode']=='assetmerge':

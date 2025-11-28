@@ -1,0 +1,741 @@
+#!/usr/bin/env python3
+"""
+reg-api-stats: Create statistics and perform checks on ingested datasets
+
+Usage:
+    ./reg-api-stats.py start
+    ./reg-api-stats.py stop
+    ./reg-api-stats.py status
+"""
+
+import os
+import sys
+import time
+import signal
+import json
+from datetime import datetime, timedelta, UTC
+import hashlib
+import zipfile
+import stat
+import argparse
+import subprocess
+
+#Set current folder to the current script path
+os.chdir(os.path.dirname(os.path.abspath(__file__)))
+
+#Load configuration file
+##We avoid to use pyyaml here, as we have a very simple YAML file
+def read_simple_yaml(path):
+    """
+    Read a minimal YAML file with:
+        group:
+          key: value
+    Returns a dict of dicts.
+    """
+    data = {}
+    current_group = None
+
+    with open(path, 'r', encoding='utf-8') as f:
+        for line in f:
+            line = line.strip()
+
+            # Skip blank lines and comments
+            if not line or line.startswith('#'):
+                continue
+
+            # Group header
+            if line.endswith(':') and not line.startswith(' '):
+                current_group = line[:-1].strip()
+                data[current_group] = {}
+                continue
+
+            # Key-value line inside a group
+            if current_group and ':' in line:
+                key, value = line.split(':', 1)
+                data[current_group][key.strip()] = value.strip()
+                continue
+
+            # If badly formatted, you could raise an error
+            # raise ValueError(f"Invalid YAML line: {line}")
+
+    return data
+
+def load_yaml(cfgfile):
+  cfg=read_simple_yaml(cfgfile)
+  #with open(cfgfile,'r') as f:
+  #  cfg=yaml.safe_load(f)
+  return cfg
+
+def load_conf():
+  CURPATH = os.path.dirname(os.path.realpath(__file__))
+  CFGPATH = os.path.realpath(os.path.join(CURPATH,"../cfg"))
+  CFGFILE = os.path.join(CFGPATH,"conf.yaml")
+  cfg=load_yaml(CFGFILE)['stats']
+  cfg['config_path']=CFGPATH
+  return cfg
+
+conf = load_conf()
+PID_FILE=conf['pid']
+LOG_FILE=conf['logfile']
+LOG_FILE_MAXSIZE=int(conf['logmaxsize'])*1024*1024
+CRON_STR=conf['cron']
+CFGPATH=conf['config_path']
+CHECKSUM_FREQUENCY=int(conf['compute_checksum_every'])
+CFGFILE = os.path.join(CFGPATH,"conf.yaml")
+del conf
+
+def log(message: str):
+    """Append a timestamped message to the log file."""
+    timestamp = datetime.now(UTC).strftime("%Y-%m-%d %H:%M:%S")
+    if LOG_FILE=="/dev/stdout":
+      print(f"[{timestamp}] {message}")
+    else:
+      if os.path.getsize(LOG_FILE) > LOG_FILE_MAXSIZE:
+        os.remove(LOG_FILE)
+      with open(LOG_FILE, "a") as f:
+        f.write(f"[{timestamp}] {message}\n")
+
+def daemonize():
+    """Detach process from terminal and run in background."""
+    if os.fork() > 0:
+        sys.exit(0)  # Exit parent
+
+    log("Starting daemon...")
+    os.setsid()
+
+    if os.fork() > 0:
+        sys.exit(0)  # Exit first child
+
+    sys.stdout.flush()
+    sys.stderr.flush()
+
+    # Redirect standard file descriptors
+    with open("/dev/null", "rb", 0) as f:
+        os.dup2(f.fileno(), sys.stdin.fileno())
+    with open("/dev/null", "ab", 0) as f:
+        os.dup2(f.fileno(), sys.stdout.fileno())
+        os.dup2(f.fileno(), sys.stderr.fileno())
+
+    # Write PID file
+    with open(PID_FILE, "w") as f:
+        f.write(str(os.getpid()))
+
+    log("Daemon started.")
+    run_daemon()
+
+def parse_cron_field(field: str, min_value: int, max_value: int):
+    """Parse a single cron field into a set of valid integer values."""
+    values = set()
+    for part in field.split(','):
+        if part == '*':
+            values.update(range(min_value, max_value + 1))
+        elif part.startswith('*/'):
+            step = int(part[2:])
+            values.update(range(min_value, max_value + 1, step))
+        elif '-' in part:
+            start, end = map(int, part.split('-'))
+            values.update(range(start, end + 1))
+        else:
+            values.add(int(part))
+    return values
+
+def next_cron_datetime(cron_expr: str, start_time = None) -> datetime:
+    """
+    Compute the next datetime that matches the given 5-field cron expression.
+    
+    Supports: minute, hour, day of month, month, day of week.
+    """
+    if start_time is None:
+        start_time = datetime.now(UTC).replace(second=0, microsecond=0)
+    else:
+        start_time = start_time.replace(second=0, microsecond=0)
+
+    minute_field, hour_field, dom_field, month_field, dow_field = cron_expr.split()
+
+    minutes = parse_cron_field(minute_field, 0, 59)
+    hours = parse_cron_field(hour_field, 0, 23)
+    days = parse_cron_field(dom_field, 1, 31)
+    months = parse_cron_field(month_field, 1, 12)
+    dows = parse_cron_field(dow_field, 0, 6)  # 0=Sunday
+
+    candidate = start_time + timedelta(minutes=1)
+
+    while True:
+        if (candidate.minute in minutes and
+            candidate.hour in hours and
+            candidate.day in days and
+            candidate.month in months and
+            candidate.weekday() in dows):
+            return candidate
+
+        candidate += timedelta(minutes=1)
+
+def get_next_run_time():
+    """Return datetime of next scheduled run."""
+
+    now = datetime.now(UTC)
+    next_run = next_cron_datetime(CRON_STR, now)
+
+    return next_run
+
+def run_daemon():
+    """Main loop for daemon."""
+    signal.signal(signal.SIGTERM, handle_exit)
+    runs_executed=0
+    while True:
+        try:
+          next_run = get_next_run_time()
+          next_run_interval_s = round((next_run - datetime.now(UTC)).total_seconds())
+        except Exception as e:
+          log(f"Invalid cron string. Exiting. {e}")
+          exit(1)
+        log(f"Next run scheduled at {next_run}. In {next_run_interval_s} seconds.")
+        time.sleep(next_run_interval_s)
+        if runs_executed>CHECKSUM_FREQUENCY:
+          check_params.skip_checksum_checks=False
+          run_job()
+          runs_executed=0
+        else:
+          check_params.skip_checksum_checks=True
+          run_job()
+        runs_executed+=1
+
+def handle_exit(signum, frame):
+    """Handle SIGTERM for clean shutdown."""
+    log("Daemon stopping...")
+    if os.path.exists(PID_FILE):
+        os.remove(PID_FILE)
+    log("Daemon stopped.")
+    sys.exit(0)
+
+
+def start():
+    if os.path.exists(PID_FILE):
+        print("Daemon already running.")
+        sys.exit(1)
+
+    daemonize()
+
+def stop():
+    if not os.path.exists(PID_FILE):
+        print("Daemon not running.")
+        return
+
+    with open(PID_FILE, "r") as f:
+        pid = int(f.read().strip())
+
+    try:
+        os.kill(pid, signal.SIGTERM)
+        print("Daemon stopped.")
+    except ProcessLookupError:
+        print("Process not found. Removing stale PID file.")
+    finally:
+        if os.path.exists(PID_FILE):
+            os.remove(PID_FILE)
+
+def status():
+    if os.path.exists(PID_FILE):
+        with open(PID_FILE, "r") as f:
+            pid = f.read().strip()
+        try:
+          os.kill(int(pid), 0)  # does not kill; just checks
+        except OSError:
+          print(f"Daemon is not running, but PID file exists (PID: {pid} DEFUNKT)")
+        else:
+          print(f"Daemon is running (PID: {pid})")
+    else:
+        print("Daemon is not running.")
+
+
+def run_job(force_colls=[]):
+  """The main task to be run."""
+  if check_params.skip_checksum_checks:
+    log("Starting stats update (skipping checksum checks)...")
+  else:
+    log("Starting stats update (including checksum checks)...")
+  try:
+    #Do stats update
+    #Load config file every time, so we get change updates
+    cfg=load_yaml(CFGFILE)
+    stac_folder=os.path.join(cfg['config']['datastore_folder'],cfg['config']['stac_subfolder'])
+    stats_folder=cfg['stats']['stats_folder']
+    del cfg
+
+    if len(force_colls)>0:
+      collist=force_colls
+    else:
+      collist=[]
+      with os.scandir(stac_folder) as it:
+        for entry in it:
+          if entry.is_dir(follow_symlinks=False):
+            collist.append(entry.name)
+    
+    collnum=0
+    colltotal=len(collist)
+    log(f"{colltotal} collections to scan!")
+
+    #Scan collection and write stats file
+    for c in collist:
+      collnum+=1
+      log(f"[{collnum}/{colltotal}] Scanning collection {c}")
+      stats_file=os.path.join(stats_folder,c+'.json')
+      stats = check_collection(c)
+      with open(stats_file, 'w') as f:
+        json.dump(stats,f, ensure_ascii=False)
+      os.chmod(stats_file, 0o644)
+      log(f"Updated stats file {stats_file}")
+
+    #Write stats file (only at the end, when all stats are retreived and only if we do not update
+    #only one specific statistic)
+    if len(force_colls)==0:
+      collist_file=os.path.join(stats_folder,'collections.list')
+      with open(collist_file,'w') as f:
+        json.dump({"lastupdated":datetime.now(UTC).isoformat(),"collections":collist},f)
+      log(f"Collection list written to {collist_file}")
+      os.chmod(collist_file, 0o644)
+
+    log("Stats retreival complete")
+  except Exception as e:
+    log(f"ERROR stats updates failed. Error: {e}")
+
+def verify_multihash(filepath,multihash):
+  # Multihash format: <hash code><digest length><digest>
+  # SHA2-256 code: 0x12, digest length: 32 bytes
+  #Get function from hash code
+  try:
+    mh = bytes.fromhex(multihash)
+  except Exception:
+    return False
+  algo_code = mh[0]
+  digest = mh[2:]
+  if algo_code == 0x11:
+    h = hashlib.sha1()
+  elif algo_code == 0x12:
+    h = hashlib.sha256()
+  elif algo_code == 0x13:
+    h = hashlib.sha512()
+  else:
+    return False
+  with open(filepath, 'rb') as f:
+    for chunk in iter(lambda: f.read(8192), b''):
+      h.update(chunk)
+  return h.digest() == digest
+
+def calculate_multihash(filepath):
+  h = hashlib.sha256()
+  with open(filepath, 'rb') as f:
+    for chunk in iter(lambda: f.read(8192), b''):
+      h.update(chunk)
+  return '1220'+h.hexdigest()
+
+#Returns
+#0 format recommended and valid
+#1 format recommended and invalid
+#2 format cannot be checked
+def verify_fileformat(filepath,fmt):
+  fmt_beginning=fmt.split(';',1)[0]
+  if fmt_beginning=='image/tiff':
+    #We recommend geotiff or cogs. Check it is valid geotiff using GDAL
+    try:
+      gdalinfo=json.loads(subprocess.check_output(['gdalinfo','-json',filepath], stderr=subprocess.STDOUT).decode('utf-8'))
+      if 'driverLongName' not in gdalinfo or gdalinfo['driverLongName']!='GeoTIFF': return 1
+    except Exception:
+      return 1
+  elif fmt_beginning in ['application/x-zarr','application/vnd+zarr','application/zip+zarr']:
+    #For Zarr, we check if it is valid
+    try:
+      if os.path.isdir(filepath):
+        zattrs_path = os.path.join(filepath, '.zattrs')
+        if not os.path.isfile(zattrs_path): return 1
+        with open(zarray_path, 'r') as f:
+          data = json.load(f)
+          del data
+        zgroup_path = os.path.join(filepath, '.zgroup')
+        if not os.path.isfile(zgroup_path): return 1
+        with open(zgroup_path, 'r') as f:
+          data = json.load(f)
+          if 'zarr_format' not in data:
+            return 1
+        return 0
+      else:
+        with zipfile.ZipFile(filepath, 'r') as zf:
+          with zf.open('.zgroup') as f:
+            data = json.load(f)
+            if 'zarr_format' not in data:
+              return 1
+            del data
+          with zf.open('.zattrs') as f:
+            data = json.load(f)
+          return 0
+    except Exception as e:
+      print(e)
+      return 1
+  elif fmt_beginning == 'application/geo+json':
+    #For GeoJSON, try to load it and check the type is valid
+    try:
+      with open(filepath,'r') as f:
+        data=json.load(f)
+      if 'type' not in data: return 1
+      if data['type'] not in ['Point', 'LineString', 'Polygon', 'MultiPoint', 'MultiLineString', 'MultiPolygon', 'GeometryCollection', 'Feature', 'FeatureCollection']: return 1
+      return 0
+    except Exception:
+      return 1
+  elif fmt_beginning ==  'application/vnd.apache.parquet':
+    try:
+      gdalinfo=json.loads(subprocess.check_output(['gdalinfo','-json',filepath], stderr=subprocess.STDOUT).decode('utf-8'))
+      if 'driverShortName' not in gdalinfo or gdalinfo['driverShortName']!='Parquet': return 1
+    except Exception:
+      return 1
+  else:
+    return 2
+
+def get_directory_size(path):
+    """
+    Fast recursive directory size calculation using os.scandir().
+    Returns size in bytes.
+    """
+    total_size = 0
+
+    def scan_dir(p):
+        nonlocal total_size
+        try:
+            with os.scandir(p) as it:
+                for entry in it:
+                    try:
+                        if entry.is_file(follow_symlinks=False):
+                            total_size += entry.stat(follow_symlinks=False).st_size
+                        elif entry.is_dir(follow_symlinks=False):
+                            scan_dir(entry.path)
+                    except OSError:
+                        # Skip files/directories we can't access
+                        pass
+        except OSError:
+            # Skip directories we can't access
+            pass
+
+    scan_dir(path)
+    return total_size
+
+def get_mime_type(path):
+  return subprocess.check_output(['file','-b','--mime-type',path],stderr=subprocess.STDOUT).decode('utf-8').strip()
+
+
+#Check global arguments
+class check_params_struct:
+    fix_file=None
+    unfix_file=None
+    diff_file=None
+    fix_file_num=0
+    fix_script_prefix='metadata'
+    fix_add_datarole=None
+    fix_remove_datarole=None
+    fix_missing_size=False
+    fix_size_mismatch=False
+    fix_missing_checksum=False
+    fix_checksum_mismatch=False
+    fix_missing_type=False
+    skip_checksum_checks=False
+
+check_params=check_params_struct()
+
+def fix_product(stac_path,fixed_stac_item):
+  #Write a batch file to apply fix and to revert it
+  global check_params
+  if check_params.fix_file is None:
+    check_params.fix_file=open(f'{check_params.fix_script_prefix}.all.fix','w')
+    check_params.unfix_file=open(f'{check_params.fix_script_prefix}.all.unfix','w')
+    check_params.diff_file=open(f'{check_params.fix_script_prefix}.all.diff','w')
+    check_params.fix_file.write("#!/bin/bash\n#This script applies patches to the metadata\n")
+    check_params.unfix_file.write("#!/bin/bash\n#This script reverts the patches applied to the metadata\n")
+    check_params.diff_file.write("#!/bin/bash\n#This script shows the patches to be applied\n")
+  #Write the new stac file
+  with open(f"{check_params.fix_script_prefix}.{check_params.fix_file_num}.fix",'w') as f:
+    json.dump(fixed_stac_item,f)
+  os.system(f"cp '{stac_path}' '{check_params.fix_script_prefix}.{check_params.fix_file_num}.unfix'")
+  check_params.fix_file.write(f"cp -f '{check_params.fix_script_prefix}.{check_params.fix_file_num}.fix' '{stac_path}'\n")
+  check_params.unfix_file.write(f"cp -f '{check_params.fix_script_prefix}.{check_params.fix_file_num}.unfix' '{stac_path}'\n")
+  #Push new stac file to the catalogue
+  cfg=load_yaml(CFGFILE)['config']
+  cat_req_url=f"{cfg['catalogue_address']}/{fixed_stac_item['collection']}/items/{fixed_stac_item['id']}"
+  check_params.fix_file.write(f"curl -k -s -S -H 'Content-Type: application/geo+json' -X PUT --data @{stac_path} '{cat_req_url}'\n")
+  check_params.unfix_file.write(f"curl -k -s -S -H 'Content-Type: application/geo+json' -X PUT --data @{stac_path} '{cat_req_url}'\n")
+  #Diff file
+  check_params.diff_file.write(f"diff -U 0 --label '{stac_path}' --label '{check_params.fix_file_num}.fix' <(jq --sort-keys . '{stac_path}') <(jq --sort-keys . '{check_params.fix_script_prefix}.{check_params.fix_file_num}.fix')\n")
+  #Increment file number
+  check_params.fix_file_num+=1
+
+#Error codes returned. Criticals are lower than 100
+# 0   All valid (no error provided)
+# 1   Invalid JSON
+# 2   No assets with valid (data or documentation) roles
+# 100 Asset is a remote asset
+# 3   Assets not found on disk
+# 4   Asset size not found in JSON
+# 5   Asset size mismatch on disk
+# 101 Asset checksum not found in JSON
+# 6   Asset checksum mismatch on disk
+# 7   Asset format not found in JSON
+# 8   Data is corrupted (asset format validation failed)
+# 102 Asset format is not recommended format (and cannot be validated)
+# 103 Collection is empty (NOTE: this is an error at collection level not product level)
+def check_product(stac_path,product_assets_path):
+  global check_params
+  #Open the JSON file. If it is invalid, we have a problem
+  try:
+    with open(stac_path,'r') as f:
+      stac_item = json.load(f)
+  except Exception as e:
+    return (0,0,0,{0:[1]})
+  #Check if there are no assets
+  if 'assets' not in stac_item:
+    return (0,0,0,{0:[2]})
+  #Apply fix to datarole if requested
+  product_needs_fix=False
+  if check_params.fix_add_datarole is not None:
+    if check_params.fix_add_datarole == '*':
+      for eln in stac_item['assets']:
+        el=stac_item['assets'][eln]
+        if 'roles' not in el:
+          el['roles']=['data']
+        elif 'data' not in el['roles']:
+          el['roles']+=['data']
+      product_needs_fix=True
+    elif check_params.fix_add_datarole in stac_item['assets']:
+      el=stac_item['assets'][check_params.fix_add_datarole]
+      if 'roles' not in el:
+        el['roles']=['data']
+      elif 'data' not in el['roles']:
+        el['roles']+=['data']
+      del el
+      product_needs_fix=True
+  if check_params.fix_remove_datarole is not None:
+    if check_params.fix_remove_datarole == '*':
+      for eln in stac_item['assets']:
+        el=stac_item['assets'][eln]
+        if 'roles' in el and 'data' in el['roles']:
+          el['roles'].remove('data')
+          product_needs_fix=True
+    elif check_params.fix_remove_datarole in stac_item['assets']:
+      el=stac_item['assets'][check_params.fix_remove_datarole]
+      if 'roles' in el and 'data' in el['roles']:
+        el['roles'].remove('data')
+        product_needs_fix=True
+  #Check assets (record number of type data assets as there should be at least one
+  num_validroles_assets=0
+  num_assets=0
+  size_assets=0
+  errors={}
+  for asset_name in stac_item['assets']:
+    num_assets=num_assets+1
+    asset=stac_item['assets'][asset_name]
+    #Check if the asset is of data type
+    asset_is_data=False
+    if 'roles' in asset:
+      if 'data' in asset['roles']:
+        num_validroles_assets+=1
+        asset_is_data=True
+      elif 'documentation' in asset['roles']:
+        num_validroles_assets+=1
+    #Check if asset is local or not
+    if 'href' not in asset or asset['href'][0]!='/':
+      errors.setdefault(asset_name, []).append(100)
+      continue
+    #Check if asset is on disk
+    asset_file=os.path.join(product_assets_path,asset['href'].split('/')[-1])
+    try:
+      asset_stat=os.stat(asset_file,follow_symlinks=False)
+    except Exception as e:
+      errors.setdefault(asset_name, []).append(3)
+      continue
+    #Get asset size
+    if stat.S_ISDIR(asset_stat.st_mode):
+      asset_size=get_directory_size(asset_file)
+    else:
+      asset_size=asset_stat.st_size
+    size_assets=size_assets+asset_size
+    #Check asset size
+    if 'file:size' not in asset:
+      if check_params.fix_missing_size:
+        asset['file:size']=asset_size
+        product_needs_fix=True
+      else:
+        errors.setdefault(asset_name, []).append(4)
+    elif asset['file:size'] != asset_size:
+      if check_params.fix_size_mismatch:
+        asset['file:size']=asset_size
+        product_needs_fix=True
+      else:
+        errors.setdefault(asset_name, []).append(5)
+        continue
+    #Check asset checksum
+    if not check_params.skip_checksum_checks:
+      if 'file:checksum' not in asset:
+        if check_params.fix_missing_checksum:
+          asset['file:checksum']=calculate_multihash(asset_file)
+          product_needs_fix=True
+        else:
+          errors.setdefault(asset_name, []).append(101)
+      elif not verify_multihash(asset_file,asset['file:checksum']):
+        if check_params.fix_checksum_mismatch:
+          asset['file:checksum']=calculate_multihash(asset_file)
+          product_needs_fix=True
+        else:
+          errors.setdefault(asset_name, []).append(6)
+          continue
+    #Check asset format type exists
+    if 'type' not in asset:
+      if check_params.fix_missing_type:
+        asset['type']=get_mime_type(asset_file)
+        product_needs_fix=True
+      else:
+        errors.setdefault(asset_name, []).append(7)
+        continue
+    #Check asset format is valid (only for data roles)
+    if asset_is_data:
+      asset_fmt_check=verify_fileformat(asset_file,asset['type'])
+      if asset_fmt_check==1:
+        errors.setdefault(asset_name, []).append(8)
+        continue
+      elif asset_fmt_check==2:
+        errors.setdefault(asset_name, []).append(102)
+
+  #There should be at least one data asset
+  if num_validroles_assets==0:
+    errors[0]=[2]
+
+  #Generate product fix
+  if product_needs_fix:
+    fix_product(stac_path,stac_item)
+
+  return (num_assets,num_validroles_assets,size_assets,errors)
+
+#Checks a collection for assets correctness, will store any error found in the errorlog file, will return the total size of the 
+def check_collection(coll_name):
+  #Load config file every time, so we get change updates
+  cfg=load_yaml(CFGFILE)['config']
+  asset_folder=os.path.join(cfg['datastore_folder'],cfg['assets_subfolder'])
+  stac_folder=os.path.join(cfg['datastore_folder'],cfg['stac_subfolder'])
+  stac_folder_len=len(stac_folder)
+  del cfg
+  #Get the stac folder path for the collection
+  path=os.path.join(stac_folder,coll_name)
+  #Total size and number of products to be returned
+  totalSize=0
+  numProducts=0
+  numAssets=0
+  numValidRolesAssets=0
+  errorProducts={}
+  errorSummary=[0]*255
+  #For the JSON folders by reg-api, you always have a path which is year/month/day
+  with os.scandir(path) as it:
+    #First level, year, no file should be here
+    for entry in it:
+      if entry.is_file(follow_symlinks=False):
+        raise(Exception("Invalid STAC folder. There should be no file at {path}/{entry.name}"))
+      elif entry.is_dir(follow_symlinks=False):
+        #Second level, month, again no file should be here
+        path2=os.path.join(path,entry.name)
+        with os.scandir(path2) as it2:
+          for entry2 in it2:
+            if entry2.is_file(follow_symlinks=False):
+              raise(Exception(f"ERROR: Invalid STAC folder. There should be no file at {path2}/{entry2.name}"))
+            elif entry2.is_dir(follow_symlinks=False):
+              #Third level, day, again no file should be here
+              path3=os.path.join(path2,entry2.name)
+              with os.scandir(path3) as it3:
+                for entry3 in it3:
+                  if entry3.is_file(follow_symlinks=False):
+                    raise(Exception(f"ERROR: Invalid STAC folder. There should be no file at {path3}/{entry3.name}"))
+                  elif entry3.is_dir(follow_symlinks=False):
+                    #Forth level, product, only files here no directories
+                    path4=os.path.join(path3,entry3.name)
+                    path4_assets=asset_folder+path4[stac_folder_len:]
+                    with os.scandir(path4) as it4:
+                      for entry4 in it4:
+                        if entry4.is_file(follow_symlinks=False):
+                          #Check product assets, return number of assets and size of assets
+                          path5=os.path.join(path4,entry4.name)
+                          path5_assets=os.path.join(path4_assets,entry4.name)
+                          product_check_results=check_product(path5,path5_assets)
+                          numAssets=numAssets+product_check_results[0]
+                          numValidRolesAssets=numValidRolesAssets+product_check_results[1]
+                          totalSize=totalSize+product_check_results[2]
+                          numProducts=numProducts+1
+                          if len(product_check_results[3])>0:
+                            errorProducts[entry4.name]=product_check_results[3]
+                          for err_asset in product_check_results[3]:
+                            err_codes = product_check_results[3][err_asset]
+                            for ecode in err_codes:
+                              errorSummary[ecode]+=1
+                        elif entry4.is_dir(follow_symlinks=False):
+                          raise(Exception(f"ERROR: Invalid STAC folder. There should be no directory at {path4}/{entry4.name}"))
+  #Flag collection-level issue of empty collection as a warning
+  if numProducts==0:
+    errorSummary[103]=-1
+  #Return result
+  return {"numProducts":numProducts,"numAssets":numAssets,"numValidRolesAssets":numValidRolesAssets,"totalSize":totalSize,"errorSummary":{k: v for k,v in enumerate(errorSummary) if v!=0},"errorProducts":errorProducts}
+
+#Main
+parser = argparse.ArgumentParser(description="Offline checks on registered collections.")
+subparsers = parser.add_subparsers()
+parser_start = subparsers.add_parser('start', help='Start as deamon. Configuration is in the config file.')
+parser_start.set_defaults(command='start')
+parser_stop = subparsers.add_parser('stop', help='Stop the deamon.')
+parser_stop.set_defaults(command='stop')
+parser_status = subparsers.add_parser('status', help='Check deamon status.')
+parser_status.set_defaults(command='status')
+parser_run = subparsers.add_parser('run', help='Run in standalone mode. Good for testing, debug and fixing operations')
+parser_run.set_defaults(command='run')
+parser_run.add_argument('--skip-checksum-checks', action='store_true', help='Skip checksum checks. Useful to speed-up analysis when you have to quickly fix issues.')
+parser_run.add_argument('--fix-script-prefix', type=str, default='metadata', metavar='<prefix>', help='Prefix for the generated fix scripts. Defaults to the local folder')
+parser_run.add_argument('--fix-missing-size', action='store_true', help='Fix missing file:size metadata, set it to current file size from disk. USE WITH CAUTION!')
+parser_run.add_argument('--fix-size-mismatch', action='store_true', help='Fix file:size metadata mismatch on disk, override current and set it to file size from disk. USE WITH CAUTION!')
+parser_run.add_argument('--fix-missing-checksum', action='store_true', help='Fix missing file:checksum metadata, set it to current file size from disk. USE WITH CAUTION!')
+parser_run.add_argument('--fix-checksum-mismatch', action='store_true', help='Fix file:checksum metadata mismatch on disk, set it to current file checks from disk. USE WITH CAUTION!')
+parser_run.add_argument('--fix-add-datarole', type=str, default=None, metavar='<assetname>', help='Add data role to asset <assetname>. Useful for fixing missing data role. Use `*` to add the data tore to all assets. USE WITH CAUTION!')
+parser_run.add_argument('--fix-remove-datarole', type=str, default=None, metavar='<assetname>', help='Remove data role for asset <assetname>. Useful for fixing wrong data role, for example for invalid asset types which should not have the data role. Use `*` to add the data tore to all assets. USE WITH CAUTION!')
+parser_run.add_argument('--fix-missing-type', action='store_true', help='Fix missing type metadata, set it to the output of file command on the asset. USE WITH CAUTION!')
+
+parser_run.add_argument('colls',nargs='*', help='Collections to perfom checks. If not set, all will be used')
+args=parser.parse_args()
+
+#Check gdalinfo avaliability, as it is required for checks on validity of data formats
+try:
+  a=subprocess.check_output(['gdalinfo','--version']).decode('utf-8')
+  if not a.startswith('GDAL '):
+    raise(Exception("Invalid GDAL version"))
+  del a
+except Exception as e:
+  print("ERROR: Cannot find gdalinfo or version incorrect. Please install gdalinfo as it is a requirement for assets file format checks"+str(e))
+  exit(1)
+
+if args.command == "start":
+  start()
+elif args.command == "stop":
+  stop()
+elif args.command == "status":
+  status()
+elif args.command == "run":
+  #Force full run (good for testing and next upgade)
+  LOG_FILE='/dev/stdout'
+  #Get command line parameters
+  check_params.fix_script_prefix=args.fix_script_prefix
+  check_params.fix_add_datarole=args.fix_add_datarole
+  check_params.fix_remove_datarole=args.fix_remove_datarole
+  check_params.fix_missing_size=args.fix_missing_size
+  check_params.fix_size_mismatch=args.fix_size_mismatch
+  check_params.fix_missing_checksum=args.fix_missing_checksum
+  check_params.fix_checksum_mismatch=args.fix_checksum_mismatch
+  check_params.fix_missing_type=args.fix_missing_type
+  check_params.skip_checksum_checks=args.skip_checksum_checks
+  #Force single run
+  run_job(args.colls)
+  #Check if fixes are applied
+  if check_params.fix_file is not None:
+    check_params.fix_file.close()
+    check_params.unfix_file.close()
+    check_params.diff_file.close()
+    print(f"There are products to fix.\nRun the 'bash {args.fix_script_prefix}.all.diff' bash script to check what fix will be applied.\nRun the 'bash -x {args.fix_script_prefix}.all.fix' to apply the fix.\nRun the 'bash -x {args.fix_script_prefix}.all.unfix' to revert to the original file.\nNOTE: Generated statistics refer to products after fixing is applied!")
+else:
+  print("Unknown command. Use start, stop, status or run.")
+  sys.exit(1)

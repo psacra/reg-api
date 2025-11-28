@@ -1,0 +1,150 @@
+[
+  {
+    "type": "Feature",
+    "stac_version": "1.1.0",
+    "stac_extensions": [
+      "https://stac-extensions.github.io/projection/v1.1.0/schema.json",
+      "https://stac-extensions.github.io/raster/v1.1.0/schema.json",
+      "https://stac-extensions.github.io/eo/v1.1.0/schema.json",
+      "https://stac-extensions.github.io/file/v2.1.0/schema.json"
+    ],
+    "id": "GeogToWGS84GeoKey5.tif",
+    "geometry": {
+      "type": "Polygon",
+      "coordinates": [
+        [
+          [
+            8.998597452336224,
+            51.99859738343058
+          ],
+          [
+            9.001402578283829,
+            51.99859739343804
+          ],
+          [
+            9.001402552000863,
+            52.001402627495914
+          ],
+          [
+            8.998597426080126,
+            52.001402617488175
+          ],
+          [
+            8.998597452336224,
+            51.99859738343058
+          ]
+        ]
+      ]
+    },
+    "bbox": [
+      8.998597426080126,
+      51.99859738343058,
+      9.001402578283829,
+      52.001402627495914
+    ],
+    "properties": {
+      "proj:epsg": null,
+      "proj:geometry": {
+        "type": "Polygon",
+        "coordinates": [
+          [
+            [
+              8.999654601821101,
+              51.9999732301211
+            ],
+            [
+              9.0024601573789,
+              51.9999732301211
+            ],
+            [
+              9.0024601573789,
+              52.0027787856789
+            ],
+            [
+              8.999654601821101,
+              52.0027787856789
+            ],
+            [
+              8.999654601821101,
+              51.9999732301211
+            ]
+          ]
+        ]
+      },
+      "proj:bbox": [
+        8.999654601821101,
+        51.9999732301211,
+        9.0024601573789,
+        52.0027787856789
+      ],
+      "proj:shape": [
+        101,
+        101
+      ],
+      "proj:transform": [
+        2.77777778e-05,
+        0.0,
+        8.999654601821101,
+        0.0,
+        -2.77777778e-05,
+        52.0027787856789,
+        0.0,
+        0.0,
+        1.0
+      ],
+      "proj:wkt2": "GEOGCS[\"unknown\",DATUM[\"unnamed\",SPHEROID[\"Bessel 1841\",6377397.155,299.152812800003,AUTHORITY[\"EPSG\",\"7004\"]],TOWGS84[598.1,73.7,418.2,0.202,0.045,-2.455,6.7]],PRIMEM[\"Greenwich\",0],UNIT[\"degree\",0.0174532925199433,AUTHORITY[\"EPSG\",\"9122\"]],AXIS[\"Latitude\",NORTH],AXIS[\"Longitude\",EAST]]",
+      "datetime": "2001-01-01T00:00:00Z",
+      "start_datetime": "2001-01-01T00:00:00Z",
+      "end_datetime": "2001-01-01T00:00:00Z"
+    },
+    "assets": {
+      "asset": {
+        "href": "GeogToWGS84GeoKey5.tif",
+        "raster:bands": [
+          {
+            "data_type": "uint8",
+            "scale": 1.0,
+            "offset": 0.0,
+            "sampling": "area",
+            "statistics": {
+              "mean": 1.796588569748064,
+              "minimum": 0,
+              "maximum": 2,
+              "stddev": 0.6044407505635215,
+              "valid_percent": 0.009802960494069209
+            },
+            "histogram": {
+              "count": 11,
+              "min": 0.0,
+              "max": 2.0,
+              "buckets": [
+                1037,
+                0,
+                0,
+                0,
+                0,
+                1,
+                0,
+                0,
+                0,
+                9163
+              ]
+            }
+          }
+        ],
+        "eo:bands": [
+          {
+            "name": "b1",
+            "description": "palette"
+          }
+        ],
+        "roles": [
+          "data"
+        ],
+        "file:size": 4058,
+        "file:checksum": "1220cdb1df0ce11e6ebe13f98a1ee2adeeea29593547f427a39bee369869a0968f23",
+        "type": "image/tiff; application=geotiff; profile=cloud-optimized"
+      }
+    }
+  }
+]

@@ -91,6 +91,14 @@ docker exec -it reg-api-server reg-api --help
 
 The documentation on API usage is available, after the execution of the service, at the `/reg-api/docs/` address.
 
+## Client
+
+reg-api includes a simple client application which can be used to ingest data. More info is [here](./client).
+
+## Statistics
+
+reg-api includes a statistic application which will generate statistics for the ingested data (size, consistency errors, format errors, etc...). Configuration of teh application is in the `cfg/conf.yaml` file and the appliction can be used as a daemon via `bin/reg-api-stats [start/stop/status]` or one-off via `bin/reg-api-stats run`. The one-off mode supports also fixing of common issues with the data metadata. For more information look at `bin/reg-api-stats --help` and `bin/reg-api-stats run --help`
+
 ## Development
 
 The script `run_development` can be used during development to enable fastapi debugging and allow modifications of the `bin` and `src` directories to propagate within the docker container execution

@@ -1,0 +1,111 @@
+#!/bin/bash
+
+set -x
+
+#Build local docker file
+echo "Building dockerfile..."
+./build_docker
+
+#TMP dir for test_data
+TMPFILE=`mktemp`
+trap "rm -f $TMPFILE" EXIT
+error() {
+  echo "ERROR: $*"
+  exit 1
+}
+
+#Simple test_data
+echo "STATIC tests"
+cd test_data
+echo "Checking rio-stac integration..."
+docker run --rm -v $PWD:/test_data eoepca/reg-api-client -v -v --dry-run -C --assets-rio-stac -u test -p test -c test --item-datetime '2001-01-01T00:00:00Z' /test_data/GeogToWGS84GeoKey5.tif > $TMPFILE
+[[ $? -ne 0 ]] && error "RIO-STAC test failed"
+diff $TMPFILE GeogToWGS84GeoKey5.expected_riostac
+[[ $? -ne 0 ]] && error "RIO-STAC test failed"
+
+echo "Check invalid size..."
+docker run --rm -v $PWD:/test_data eoepca/reg-api-client -v -v --dry-run -C -u test -p test -c test --item-datetime '2001-01-01T00:00:00Z' /test_data/GeogToWGS84GeoKey5.invalid_size
+[[ $? -ne 0 ]] || error "Invalid size test failed"
+
+echo "Check invalid checksum..."
+docker run --rm -v $PWD:/test_data eoepca/reg-api-client -v -v --dry-run -C -u test -p test -c test --item-datetime '2001-01-01T00:00:00Z' /test_data/GeogToWGS84GeoKey5.invalid_checksum
+[[ $? -ne 0 ]] || error "Invalid checksum test failed"
+
+echo "Check calculate checksum and generate type..."
+docker run --rm -v $PWD:/test_data eoepca/reg-api-client -v -v --dry-run -C -u test -p test -c test --item-datetime '2001-01-01T00:00:00Z' /test_data/GeogToWGS84GeoKey5.no_checksum_no_type > $TMPFILE
+[[ $? -ne 0 ]] && error "Checksum and size addition failed"
+diff $TMPFILE GeogToWGS84GeoKey5.expected_stac
+[[ $? -ne 0 ]] && error "Checksum and size addition failed"
+
+echo "Check item data regex"
+docker run --rm -v $PWD:/test_data eoepca/reg-api-client -v -v --dry-run -C -u test -p test -c test --item-date-regex 'Test_(?P<sY>[0-9]{4})' /test_data/Test_20010205_20230301_data.tif > $TMPFILE
+[[ $? -ne 0 ]] && error "Item data regex test failed"
+diff $TMPFILE Test_20010205_20230301_data.expected200101
+[[ $? -ne 0 ]] && error "Item data regex test failed"
+
+docker run --rm -v $PWD:/test_data eoepca/reg-api-client -v -v --dry-run -C -u test -p test -c test --item-date-regex 'Test_(?P<sY>[0-9]{4})(?P<sm>[0-9]{2})' /test_data/Test_20010205_20230301_data.tif > $TMPFILE
+[[ $? -ne 0 ]] && error "Item data regex test failed"
+diff $TMPFILE Test_20010205_20230301_data.expected200102
+[[ $? -ne 0 ]] && error "Item data regex test failed"
+
+docker run --rm -v $PWD:/test_data eoepca/reg-api-client -v -v --dry-run -C -u test -p test -c test --item-date-regex 'Test_(?P<sY>[0-9]{4})(?P<sm>[0-9]{2})(?P<sD>[0-9]{2})_(?P<eY>[0-9]{4})' /test_data/Test_20010205_20230301_data.tif > $TMPFILE
+[[ $? -ne 0 ]] && error "Item data regex test failed"
+diff $TMPFILE Test_20010205_20230301_data.expected200102_2023
+[[ $? -ne 0 ]] && error "Item data regex test failed"
+
+#Dynamic tests
+TEST_REGAPI_URL="${TEST_REGAPI_URL:=http://127.0.0.1/reg-api}"
+TEST_CAT_URL="${TEST_CAT_URL:=http://127.0.0.1/collections}"
+TEST_S3_URL="${TEST_S3_URL:=http://127.0.0.1/}"
+TEST_COLLECTION="${TEST_COLLECTION:=PRR_TEST}"
+TEST_BUCKET="${TEST_BUCKET:=sg-test-generic}"
+TEST_USERNAME="${TEST_USERNAME:=test}"
+[[ -z "$TEST_PASSWORD" ]] && echo "To run dynamic tests, please start with the TEST_PASSWORD environment variable" && exit 1
+echo "DYNAMIC tests. TEST_COLLETION=$TEST_COLLECTION , TEST_USERNAME=$TEST_USERNAME , TEST_PASSWORD=$TEST_PASSWORD , TEST_REGAPI_URL=$TEST_REGAPI_URL , TEST_CAT_URL=$TEST_CAT_URL , TEST_S3_URL=$TEST_S3_URL"
+
+echo "Check asset upload..."
+curl -X DELETE -u "$TEST_USERNAME:$TEST_PASSWORD" "$TEST_REGAPI_URL/collections/$TEST_COLLECTION/items/GeogToWGS84GeoKey5"
+docker run --rm -v $PWD:/test_data --network=host eoepca/reg-api-client -v -v --rapi-endpoint "$TEST_REGAPI_URL" --rapi-s3-endpoint "$TEST_S3_URL" -u "$TEST_USERNAME" -p "$TEST_PASSWORD" -c "$TEST_COLLECTION" -b "$TEST_BUCKET" /test_data/StacItemTest.valid.json > $TMPFILE
+[[ $? -ne 0 ]] && error "Check asset upload failed"
+curl "$TEST_CAT_URL/$TEST_COLLECTION/items/GeogToWGS84GeoKey5" > $TMPFILE
+[[ $? -ne 0 ]] && error "Check asset upload failed"
+diff $TMPFILE StacItemTest.valid_expected
+[[ $? -ne 0 ]] && error "Check asset upload failed"
+curl -X DELETE -u "$TEST_USERNAME:$TEST_PASSWORD" "$TEST_REGAPI_URL/collections/$TEST_COLLECTION/items/GeogToWGS84GeoKey5"
+[[ $? -ne 0 ]] && error "Check asset upload failed"
+
+echo "Check rio-stac asset upload..."
+curl -X DELETE -u "$TEST_USERNAME:$TEST_PASSWORD" "$TEST_REGAPI_URL/collections/$TEST_COLLECTION/items/GeogToWGS84GeoKey5.tif"
+docker run --rm -v $PWD:/test_data --network=host eoepca/reg-api-client -v -v --assets-rio-stac --rapi-endpoint "$TEST_REGAPI_URL" --rapi-s3-endpoint "$TEST_S3_URL" -u "$TEST_USERNAME" -p "$TEST_PASSWORD" -c "$TEST_COLLECTION" -b "$TEST_BUCKET" --item-datetime '2001-01-01T00:00:00Z' /test_data/GeogToWGS84GeoKey5.tif
+[[ $? -ne 0 ]] && error "Check rio-stac asset upload failed"
+curl "$TEST_CAT_URL/$TEST_COLLECTION/items/GeogToWGS84GeoKey5.tif" > $TMPFILE
+[[ $? -ne 0 ]] && error "Check asset upload failed"
+diff $TMPFILE StacItemTest.valid_rioexpected
+[[ $? -ne 0 ]] && error "Check asset upload failed"
+curl -X DELETE -u "$TEST_USERNAME:$TEST_PASSWORD" "$TEST_REGAPI_URL/collections/$TEST_COLLECTION/items/GeogToWGS84GeoKey5.tif"
+[[ $? -ne 0 ]] && error "Check asset upload failed"
+
+echo "Check directory asset upload (zipped)..."
+curl -X DELETE -u "$TEST_USERNAME:$TEST_PASSWORD" "$TEST_REGAPI_URL/collections/$TEST_COLLECTION/items/Test_Dir_Element"
+docker run --rm -v $PWD:/test_data --network=host --entrypoint /bin/sh eoepca/reg-api-client -c "cp -r /test_data/Test_Dir_Element /tmp/Test_Dir_Element; python /bin/reg-api-client -v -v --assets-rio-stac --rapi-endpoint '$TEST_REGAPI_URL' --rapi-s3-endpoint '$TEST_S3_URL' -u '$TEST_USERNAME' -p '$TEST_PASSWORD' -c '$TEST_COLLECTION' -b '$TEST_BUCKET' --item-datetime '2001-01-01T00:00:00Z' /tmp/Test_Dir_Element"
+[[ $? -ne 0 ]] && error "Check directory asset upload (zipped) failed"
+curl "$TEST_CAT_URL/$TEST_COLLECTION/items/Test_Dir_Element" > $TMPFILE
+[[ $? -ne 0 ]] && error "Check asset upload failed"
+diff $TMPFILE Test_Dir_Element_expected.zipped
+[[ $? -ne 0 ]] && error "Check asset upload failed"
+curl -X DELETE -u "$TEST_USERNAME:$TEST_PASSWORD" "$TEST_REGAPI_URL/collections/$TEST_COLLECTION/items/Test_Dir_Element"
+[[ $? -ne 0 ]] && error "Check asset upload failed"
+
+
+echo "Check directory asset upload (unzipped)..."
+curl -X DELETE -u "$TEST_USERNAME:$TEST_PASSWORD" "$TEST_REGAPI_URL/collections/$TEST_COLLECTION/items/Test_Dir_Element"
+docker run --rm -v $PWD:/test_data --network=host eoepca/reg-api-client -v -v --item-asset-zipping-disable --rapi-endpoint "$TEST_REGAPI_URL" --rapi-s3-endpoint "$TEST_S3_URL" -u "$TEST_USERNAME" -p "$TEST_PASSWORD" -c "$TEST_COLLECTION" -b "$TEST_BUCKET" --item-datetime '2001-01-01T00:00:00Z' /test_data/Test_Dir_Element
+[[ $? -ne 0 ]] && error "Check directory asset upload (unzipped) failed"
+curl "$TEST_CAT_URL/$TEST_COLLECTION/items/Test_Dir_Element" > $TMPFILE
+[[ $? -ne 0 ]] && error "Check asset upload failed"
+diff $TMPFILE Test_Dir_Element_expected.unzipped
+[[ $? -ne 0 ]] && error "Check asset upload failed"
+curl -X DELETE -u "$TEST_USERNAME:$TEST_PASSWORD" "$TEST_REGAPI_URL/collections/$TEST_COLLECTION/items/Test_Dir_Element"
+[[ $? -ne 0 ]] && error "Check asset upload failed"
+
+echo "All tests completed successfully!!!"
